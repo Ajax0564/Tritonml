@@ -1,6 +1,6 @@
 import triton
 import triton.language as tl
-import torch
+import torch 
 
 @triton.jit
 def add_kernel(x_ptr,  # *Pointer* to first input vector.
@@ -39,3 +39,80 @@ def sub(x_ptr,y_ptr,out_ptr,n_elements,BlockSize: tl.constexpr):
     y = tl.load(y_ptr+offsets,mask=mask)
     output = x-y
     tl.store(out_ptr+offsets,output,mask=mask)
+
+
+@triton.jit
+def rgb2grey_k(x_ptr, out_ptr, h, w, bs0: tl.constexpr, bs1: tl.constexpr):
+    """
+    GPU kernel for converting RGB image to grayscale
+    
+    Args:
+        x_ptr: Pointer to input RGB image data
+        out_ptr: Pointer to output grayscale image data
+        h: Image height
+        w: Image width
+        bs0: Block size for height dimension
+        bs1: Block size for width dimension
+    """
+    # Get program IDs for parallel processing
+    pid_0 = tl.program_id(0)  # Block ID in height dimension
+    pid_1 = tl.program_id(1)  # Block ID in width dimension
+    
+    # Calculate offsets for this block
+    offs_0 = pid_0 * bs0 + tl.arange(0, bs0)  # Offsets in height dimension
+    offs_1 = pid_1 * bs1 + tl.arange(0, bs1)  # Offsets in width dimension
+    
+    # Calculate 2D offset matrix
+    offs = w * offs_0[:,None] + offs_1[None, :]
+    
+    # Create masks to handle image boundaries
+    mask_0 = offs_0 < h
+    mask_1 = offs_1 < w
+    mask = mask_0[:,None] & mask_1[None,:]
+    
+    # Load RGB channels
+    r = tl.load(x_ptr + 0*h*w + offs, mask=mask)
+    g = tl.load(x_ptr + 1*h*w + offs, mask=mask)
+    b = tl.load(x_ptr + 2*h*w + offs, mask=mask)
+    
+    # Convert to grayscale using standard weights
+    # These weights represent human perception of color:
+    # Red: 29.89%, Green: 58.70%, Blue: 11.40%
+    out = 0.2989*r + 0.5870*g + 0.1140*b
+    
+    # Store the result
+    tl.store(out_ptr + offs, out, mask=mask)
+
+
+def cdiv(n, d):
+    """
+    Compute ceiling division between two numbers.
+    Args:
+        n: Numerator
+        d: Denominator
+    Returns:
+        Ceiling division result
+    """
+    return (n + d - 1) // d
+
+def rgb2grey(x, bs):
+    """
+    Convert RGB image to grayscale using GPU acceleration
+
+    Args:
+        x: Input RGB image tensor (channels, height, width)
+        bs: Tuple of block sizes (height, width) for GPU processing
+
+    Returns:
+        Grayscale image tensor (height, width)
+    """
+    c, h, w = x.shape
+    # Create output tensor
+    out = torch.empty((h,w), dtype=x.dtype, device=x.device)
+
+    # Define processing grid based on block sizes
+    grid = lambda meta: (cdiv(h, meta['bs0']), cdiv(w, meta['bs1']))
+
+    # Launch GPU kernel
+    rgb2grey_k[grid](x, out, h, w, bs0=bs[0], bs1=bs[1])
+    return out.view(h,w)
