@@ -53,7 +53,6 @@ def gelu_backward_kernel(
     
     tl.store(grad_in_ptr + offs, grad_in, mask=mask)
 
-# --- 2. PYTORCH AUTOGRAD WRAPPER ---
 
 class TritonGELU(torch.autograd.Function):
     @staticmethod
