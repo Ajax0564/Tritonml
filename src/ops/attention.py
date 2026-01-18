@@ -3,9 +3,6 @@ import triton
 import triton.language as tl
 import math
 
-# ============================================================
-# Forward kernel
-# ============================================================
 @triton.jit
 def _attn_fwd_kernel(
     Q, K, V, Mask, sm_scale, L, Out,
@@ -36,7 +33,10 @@ def _attn_fwd_kernel(
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
 
-    mask_ptr = Mask + (pid_hz // HEADS) * stride_mb + (pid_hz % HEADS) * stride_mh
+    # ===============================
+    # CHANGED: mask is (B, 1, S, S)
+    # ===============================
+    mask_ptr = Mask + (pid_hz // HEADS) * stride_mb
 
     for start_n in range(0, SEQ_LEN, BLOCK_N):
         cols = start_n + rn
@@ -87,6 +87,7 @@ def _attn_fwd_kernel(
     )
 
 
+
 # ============================================================
 # Backward kernel
 # ============================================================
@@ -106,7 +107,7 @@ def _attn_bwd_kernel(
     pid_hz = tl.program_id(0)
     rk = tl.arange(0, HEAD_DIM)
 
-    mask_ptr = Mask + (pid_hz // HEADS) * stride_mb + (pid_hz % HEADS) * stride_mh
+    mask_ptr = Mask + (pid_hz // HEADS) * stride_mb
 
     # ---------------- dQ ----------------
     for start_m in range(0, SEQ_LEN, BLOCK_M):
@@ -290,6 +291,44 @@ def _attn_bwd_kernel(
             mask=rn[:, None] < SEQ_LEN,
         )
 
+class FlashAttentionSafe(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, mask, sm_scale):
+        B, H, S, D = q.shape
+        o = torch.empty_like(q)
+        lse = torch.empty((B * H, S), device=q.device, dtype=torch.float32)
+        mask_stride_mb, mask_stride_mh, mask_stride_mm, mask_stride_mn = mask.stride()
+        _attn_fwd_kernel[(triton.cdiv(S, 64), B * H)](
+            q, k, v, mask, sm_scale, lse, o,
+            *q.stride(), *k.stride(), *v.stride(),
+            mask_stride_mb, 0, mask_stride_mm, mask_stride_mn, *o.stride(),
+            B, H, S, D,
+            BLOCK_M=64, BLOCK_N=32,
+        )
+
+        ctx.save_for_backward(q, k, v, mask, lse)
+        ctx.sm_scale = sm_scale
+        return o
+
+    @staticmethod
+    def backward(ctx, do):
+        q, k, v, mask, lse = ctx.saved_tensors
+        B, H, S, D = q.shape
+
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        mask_stride_mb, mask_stride_mh, mask_stride_mm, mask_stride_mn = mask.stride()
+        _attn_bwd_kernel[(B * H,)](
+            q, k, v, mask, ctx.sm_scale,
+            do, dq, dk, dv, lse,
+            *q.stride(), *k.stride(), *v.stride(), mask_stride_mb, 0, mask_stride_mm, mask_stride_mn,
+            B, H, S, D,
+            BLOCK_M=64, BLOCK_N=32,
+        )
+
+        return dq, dk, dv, None, None
+
 # ============================================================
 # Test
 # ============================================================
@@ -300,7 +339,7 @@ def test():
         for _ in range(3)
     ]
 
-    mask = torch.tril(torch.ones((B, H, S, S), device="cuda"))
+    mask = torch.tril(torch.ones((B, 1, S, S), device="cuda"))
     mask = torch.where(mask > 0, 0.0, float("-inf")).to(torch.float16)
 
     do = torch.randn_like(q)
@@ -321,5 +360,122 @@ def test():
     print("dV Diff:", (ref_grads[2] - v.grad).abs().max().item())
 
 
+import torch
+import time
+import math
+import matplotlib.pyplot as plt
+
+# ==============================================
+# Ensure FlashAttentionSafe is imported/defined here
+# from your_flash_attention_module import FlashAttentionSafe
+# ==============================================
+
+def benchmark(batch=1, heads=8, dim=64, seq_lens=None, n_iters=20, device='cuda'):
+    if seq_lens is None:
+        seq_lens = [64, 128, 256, 512, 1024, 2048]
+
+    fwd_times = []
+    bwd_times = []
+    fwd_bwd_times = []
+    fwd_tflops = []
+    bwd_tflops = []
+
+    for S in seq_lens:
+        # -------------------------
+        # Allocate random inputs
+        # -------------------------
+        q = torch.randn((batch, heads, S, dim), device=device, dtype=torch.float16, requires_grad=True)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
+        mask = torch.tril(torch.ones((batch, 1, S, S), device=device, dtype=torch.float16))
+        mask = torch.where(mask > 0, 0.0, float('-inf'))
+
+        scale = 1.0 / math.sqrt(dim)
+        do = torch.randn_like(q)
+
+        # -------------------------
+        # Warmup
+        # -------------------------
+        for _ in range(5):
+            out = FlashAttentionSafe.apply(q, k, v, mask, scale)
+            out.backward(do)
+            q.grad = k.grad = v.grad = None
+
+        # -------------------------
+        # Forward benchmark
+        # -------------------------
+        torch.cuda.synchronize()
+        t0 = time.time()
+        for _ in range(n_iters):
+            out = FlashAttentionSafe.apply(q, k, v, mask, scale)
+        torch.cuda.synchronize()
+        fwd_time = (time.time() - t0) / n_iters * 1000  # ms
+        fwd_times.append(fwd_time)
+
+        # -------------------------
+        # Backward benchmark (fresh forward each iteration)
+        # -------------------------
+        torch.cuda.synchronize()
+        t0 = time.time()
+        for _ in range(n_iters):
+            out = FlashAttentionSafe.apply(q, k, v, mask, scale)
+            out.backward(do)
+            q.grad = k.grad = v.grad = None
+        torch.cuda.synchronize()
+        bwd_time = (time.time() - t0) / n_iters * 1000  # ms
+        bwd_times.append(bwd_time)
+
+        # -------------------------
+        # Forward + Backward combined
+        # -------------------------
+        torch.cuda.synchronize()
+        t0 = time.time()
+        for _ in range(n_iters):
+            out = FlashAttentionSafe.apply(q, k, v, mask, scale)
+            out.backward(do)
+            q.grad = k.grad = v.grad = None
+        torch.cuda.synchronize()
+        fwd_bwd_time = (time.time() - t0) / n_iters * 1000  # ms
+        fwd_bwd_times.append(fwd_bwd_time)
+
+        # -------------------------
+        # Compute TFLOPs estimate
+        # -------------------------
+        # FLOPs: 2 * S * S * dim * heads * batch (approx for attention matmul)
+        flops = 2 * batch * heads * S * S * dim
+        fwd_tflops.append(flops / (fwd_time * 1e-3) / 1e12)
+        bwd_tflops.append(flops / (bwd_time * 1e-3) / 1e12)
+
+        print(f"Seq {S:4d} | Forward: {fwd_time:.2f} ms | Backward: {bwd_time:.2f} ms | "
+              f"Fwd TFLOPs: {fwd_tflops[-1]:.2f} | Bwd TFLOPs: {bwd_tflops[-1]:.2f}")
+
+    # -------------------------
+    # Plot timing results
+    # -------------------------
+    plt.figure(figsize=(10, 6))
+    plt.plot(seq_lens, fwd_times, 'o-', label='Forward (ms)')
+    plt.plot(seq_lens, bwd_times, 's-', label='Backward (ms)')
+    plt.plot(seq_lens, fwd_bwd_times, 'x-', label='Forward + Backward (ms)')
+    plt.xlabel('Sequence Length')
+    plt.ylabel('Time (ms)')
+    plt.title('Triton FlashAttention Benchmark')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    # -------------------------
+    # Plot TFLOPs
+    # -------------------------
+    plt.figure(figsize=(10, 6))
+    plt.plot(seq_lens, fwd_tflops, 'o-', label='Forward TFLOPs')
+    plt.plot(seq_lens, bwd_tflops, 's-', label='Backward TFLOPs')
+    plt.xlabel('Sequence Length')
+    plt.ylabel('TFLOPs')
+    plt.title('Triton FlashAttention Estimated Throughput')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
 if __name__ == "__main__":
-    test()
+    benchmark()
