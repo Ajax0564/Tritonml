@@ -1,7 +1,8 @@
 import torch
 import triton
 import triton.language as tl
-import math
+
+# --- 1. KERNELS ---
 
 @triton.jit
 def _attn_fwd_kernel(
@@ -12,9 +13,7 @@ def _attn_fwd_kernel(
     stride_mb, stride_mh, stride_mm, stride_mn,
     stride_ob, stride_oh, stride_om, stride_ok,
     BATCH, HEADS, SEQ_LEN,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_hz = tl.program_id(1)
@@ -23,44 +22,21 @@ def _attn_fwd_kernel(
     rn = tl.arange(0, BLOCK_N)
     rk = tl.arange(0, HEAD_DIM)
 
-    q = tl.load(
-        Q + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :],
-        mask=rm[:, None] < SEQ_LEN,
-        other=0.0,
-    ).to(tl.float32)
+    q = tl.load(Q + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :], mask=rm[:, None] < SEQ_LEN, other=0.0).to(tl.float32)
 
     m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
 
-    # ===============================
-    # CHANGED: mask is (B, 1, S, S)
-    # ===============================
     mask_ptr = Mask + (pid_hz // HEADS) * stride_mb
 
     for start_n in range(0, SEQ_LEN, BLOCK_N):
         cols = start_n + rn
-
-        k = tl.load(
-            K + pid_hz * stride_kh + cols[None, :] * stride_kn + rk[:, None] * stride_kk,
-            mask=cols[None, :] < SEQ_LEN,
-            other=0.0,
-        ).to(tl.float32)
-
-        v = tl.load(
-            V + pid_hz * stride_vh + cols[:, None] * stride_vn + rk[None, :],
-            mask=cols[:, None] < SEQ_LEN,
-            other=0.0,
-        ).to(tl.float32)
+        k = tl.load(K + pid_hz * stride_kh + cols[None, :] * stride_kn + rk[:, None] * stride_kk, mask=cols[None, :] < SEQ_LEN, other=0.0).to(tl.float32)
+        v = tl.load(V + pid_hz * stride_vh + cols[:, None] * stride_vn + rk[None, :], mask=cols[:, None] < SEQ_LEN, other=0.0).to(tl.float32)
 
         qk = tl.dot(q, k) * sm_scale
-
-        m_tile = tl.load(
-            mask_ptr + rm[:, None] * stride_mm + cols[None, :] * stride_mn,
-            mask=(rm[:, None] < SEQ_LEN) & (cols[None, :] < SEQ_LEN),
-            other=-float("inf"),
-        )
-
+        m_tile = tl.load(mask_ptr + rm[:, None] * stride_mm + cols[None, :] * stride_mn, mask=(rm[:, None] < SEQ_LEN) & (cols[None, :] < SEQ_LEN), other=-float("inf"))
         qk += m_tile
 
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
@@ -73,409 +49,158 @@ def _attn_fwd_kernel(
         m_i = m_ij
 
     out = acc / l_i[:, None]
+    tl.store(Out + pid_hz * stride_oh + rm[:, None] * stride_om + rk[None, :], out.to(tl.float16), mask=rm[:, None] < SEQ_LEN)
+    tl.store(L + pid_hz * SEQ_LEN + rm, m_i + tl.log(l_i), mask=rm < SEQ_LEN)
 
-    tl.store(
-        Out + pid_hz * stride_oh + rm[:, None] * stride_om + rk[None, :],
-        out.to(tl.float16),
-        mask=rm[:, None] < SEQ_LEN,
-    )
-
-    tl.store(
-        L + pid_hz * SEQ_LEN + rm,
-        m_i + tl.log(l_i),
-        mask=rm < SEQ_LEN,
-    )
-
-
-
-# ============================================================
-# Backward kernel
-# ============================================================
 @triton.jit
-def _attn_bwd_kernel(
-    Q, K, V, Mask, sm_scale,
-    dO, dQ, dK, dV, L,
-    stride_qb, stride_qh, stride_qm, stride_qk,
-    stride_kb, stride_kh, stride_kn, stride_kk,
-    stride_vb, stride_vh, stride_vn, stride_vk,
-    stride_mb, stride_mh, stride_mm, stride_mn,
-    BATCH, HEADS, SEQ_LEN,
-    HEAD_DIM: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    pid_hz = tl.program_id(0)
-    rk = tl.arange(0, HEAD_DIM)
+def _bwd_preprocess_kernel(Out, dOut, D, stride_ob, stride_oh, stride_om, stride_ok, BATCH, HEADS, SEQ_LEN, BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr):
+    pid_m, pid_hz = tl.program_id(0), tl.program_id(1)
+    rm, rk = pid_m * BLOCK_M + tl.arange(0, BLOCK_M), tl.arange(0, HEAD_DIM)
+    off_o = pid_hz * stride_oh + rm[:, None] * stride_om + rk[None, :]
+    o = tl.load(Out + off_o, mask=rm[:, None] < SEQ_LEN, other=0.0).to(tl.float32)
+    do = tl.load(dOut + off_o, mask=rm[:, None] < SEQ_LEN, other=0.0).to(tl.float32)
+    tl.store(D + pid_hz * SEQ_LEN + rm, tl.sum(o * do, axis=1), mask=rm < SEQ_LEN)
 
+@triton.jit
+def _bwd_kernel_dq(Q, K, V, Mask, sm_scale, dO, dQ, L, D, stride_qb, stride_qh, stride_qm, stride_qk, stride_kb, stride_kh, stride_kn, stride_kk, stride_mb, stride_mh, stride_mm, stride_mn, BATCH, HEADS, SEQ_LEN, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr):
+    pid_m, pid_hz = tl.program_id(0), tl.program_id(1)
+    rm, rk = pid_m * BLOCK_M + tl.arange(0, BLOCK_M), tl.arange(0, HEAD_DIM)
+    q = tl.load(Q + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :], mask=rm[:, None] < SEQ_LEN, other=0.0)
+    do = tl.load(dO + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :], mask=rm[:, None] < SEQ_LEN, other=0.0)
+    lse = tl.load(L + pid_hz * SEQ_LEN + rm, mask=rm < SEQ_LEN)
+    di = tl.load(D + pid_hz * SEQ_LEN + rm, mask=rm < SEQ_LEN)
+    dq = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
     mask_ptr = Mask + (pid_hz // HEADS) * stride_mb
-
-    # ---------------- dQ ----------------
-    for start_m in range(0, SEQ_LEN, BLOCK_M):
-        rm = start_m + tl.arange(0, BLOCK_M)
-
-        q = tl.load(
-            Q + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :],
-            mask=rm[:, None] < SEQ_LEN,
-            other=0.0,
-        ).to(tl.float32)
-
-        do = tl.load(
-            dO + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :],
-            mask=rm[:, None] < SEQ_LEN,
-            other=0.0,
-        ).to(tl.float32)
-
-        lse = tl.load(
-            L + pid_hz * SEQ_LEN + rm,
-            mask=rm < SEQ_LEN,
-            other=0.0,
-        )
-
-        dq = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
-        Di = tl.zeros([BLOCK_M], tl.float32)
-
-        # First pass: compute Di
-        for start_n in range(0, SEQ_LEN, BLOCK_N):
-            rn = start_n + tl.arange(0, BLOCK_N)
-
-            k = tl.load(
-                K + pid_hz * stride_kh + rn[None, :] * stride_kn + rk[:, None] * stride_kk,
-                mask=rn[None, :] < SEQ_LEN,
-                other=0.0,
-            ).to(tl.float32)
-
-            v = tl.load(
-                V + pid_hz * stride_vh + rn[:, None] * stride_vn + rk[None, :],
-                mask=rn[:, None] < SEQ_LEN,
-                other=0.0,
-            ).to(tl.float32)
-
-            qk = tl.dot(q, k) * sm_scale
-            m_tile = tl.load(
-                mask_ptr + rm[:, None] * stride_mm + rn[None, :] * stride_mn,
-                mask=(rm[:, None] < SEQ_LEN) & (rn[None, :] < SEQ_LEN),
-                other=-float("inf"),
-            )
-            qk += m_tile
-
-            p = tl.exp(qk - lse[:, None])
-            Di += tl.sum(p * tl.dot(do, tl.trans(v)), axis=1)
-
-        # Second pass: compute dQ
-        for start_n in range(0, SEQ_LEN, BLOCK_N):
-            rn = start_n + tl.arange(0, BLOCK_N)
-
-            k = tl.load(
-                K + pid_hz * stride_kh + rn[None, :] * stride_kn + rk[:, None] * stride_kk,
-                mask=rn[None, :] < SEQ_LEN,
-                other=0.0,
-            ).to(tl.float32)
-
-            v = tl.load(
-                V + pid_hz * stride_vh + rn[:, None] * stride_vn + rk[None, :],
-                mask=rn[:, None] < SEQ_LEN,
-                other=0.0,
-            ).to(tl.float32)
-
-            qk = tl.dot(q, k) * sm_scale
-            m_tile = tl.load(
-                mask_ptr + rm[:, None] * stride_mm + rn[None, :] * stride_mn,
-                mask=(rm[:, None] < SEQ_LEN) & (rn[None, :] < SEQ_LEN),
-                other=-float("inf"),
-            )
-            qk += m_tile
-
-            p = tl.exp(qk - lse[:, None])
-            dp = (tl.dot(do, tl.trans(v)) - Di[:, None]) * p * sm_scale
-            dq += tl.dot(dp, tl.trans(k))
-
-        tl.store(
-            dQ + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :],
-            dq.to(tl.float16),
-            mask=rm[:, None] < SEQ_LEN,
-        )
-
-        # ---------------- dK / dV ----------------
     for start_n in range(0, SEQ_LEN, BLOCK_N):
         rn = start_n + tl.arange(0, BLOCK_N)
+        k = tl.load(K + pid_hz * stride_kh + rn[None, :] * stride_kn + rk[:, None] * stride_kk, mask=rn[None, :] < SEQ_LEN, other=0.0)
+        v = tl.load(V + pid_hz * stride_kh + rn[:, None] * stride_kn + rk[None, :], mask=rn[:, None] < SEQ_LEN, other=0.0)
+        qk = tl.dot(q, k) * sm_scale
+        m_tile = tl.load(mask_ptr + rm[:, None] * stride_mm + rn[None, :] * stride_mn, mask=(rm[:, None] < SEQ_LEN) & (rn[None, :] < SEQ_LEN), other=-float('inf'))
+        p = tl.exp(qk + m_tile - lse[:, None])
+        dp = (tl.dot(do, tl.trans(v)) - di[:, None]) * p
+        dq += tl.dot(dp.to(tl.float16), tl.trans(k))
+    tl.store(dQ + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :], (dq * sm_scale).to(tl.float16), mask=rm[:, None] < SEQ_LEN)
 
-        dk = tl.zeros([BLOCK_N, HEAD_DIM], tl.float32)
-        dv = tl.zeros([BLOCK_N, HEAD_DIM], tl.float32)
+@triton.jit
+def _bwd_kernel_dkdv(Q, K, V, Mask, sm_scale, dO, dK, dV, L, D, stride_qb, stride_qh, stride_qm, stride_qk, stride_kb, stride_kh, stride_kn, stride_kk, stride_mb, stride_mh, stride_mm, stride_mn, BATCH, HEADS, SEQ_LEN, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr):
+    pid_n, pid_hz = tl.program_id(0), tl.program_id(1)
+    rn, rk = pid_n * BLOCK_N + tl.arange(0, BLOCK_N), tl.arange(0, HEAD_DIM)
+    k = tl.load(K + pid_hz * stride_kh + rn[:, None] * stride_kn + rk[None, :], mask=rn[:, None] < SEQ_LEN, other=0.0)
+    v = tl.load(V + pid_hz * stride_kh + rn[:, None] * stride_kn + rk[None, :], mask=rn[:, None] < SEQ_LEN, other=0.0)
+    dk, dv = tl.zeros([BLOCK_N, HEAD_DIM], tl.float32), tl.zeros([BLOCK_N, HEAD_DIM], tl.float32)
+    mask_ptr = Mask + (pid_hz // HEADS) * stride_mb
+    for start_m in range(0, SEQ_LEN, BLOCK_M):
+        rm = start_m + tl.arange(0, BLOCK_M)
+        q = tl.load(Q + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :], mask=rm[:, None] < SEQ_LEN, other=0.0)
+        do = tl.load(dO + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :], mask=rm[:, None] < SEQ_LEN, other=0.0)
+        lse, di = tl.load(L + pid_hz * SEQ_LEN + rm, mask=rm < SEQ_LEN), tl.load(D + pid_hz * SEQ_LEN + rm, mask=rm < SEQ_LEN)
+        qk = tl.dot(q, tl.trans(k)) * sm_scale
+        m_tile = tl.load(mask_ptr + rm[:, None] * stride_mm + rn[None, :] * stride_mn, mask=(rm[:, None] < SEQ_LEN) & (rn[None, :] < SEQ_LEN), other=-float('inf'))
+        p = tl.exp(qk + m_tile - lse[:, None])
+        dv += tl.dot(tl.trans(p.to(tl.float16)), do)
+        dp = (tl.dot(do, tl.trans(v)) - di[:, None]) * p
+        dk += tl.dot(tl.trans(dp.to(tl.float16)), q)
+    tl.store(dK + pid_hz * stride_kh + rn[:, None] * stride_kn + rk[None, :], (dk * sm_scale).to(tl.float16), mask=rn[:, None] < SEQ_LEN)
+    tl.store(dV + pid_hz * stride_kh + rn[:, None] * stride_kn + rk[None, :], dv.to(tl.float16), mask=rn[:, None] < SEQ_LEN)
 
-        k = tl.load(
-            K + pid_hz * stride_kh + rn[:, None] * stride_kn + rk[None, :],
-            mask=rn[:, None] < SEQ_LEN,
-            other=0.0,
-        ).to(tl.float32)
+# --- 2. WRAPPER ---
 
-        v = tl.load(
-            V + pid_hz * stride_vh + rn[:, None] * stride_vn + rk[None, :],
-            mask=rn[:, None] < SEQ_LEN,
-            other=0.0,
-        ).to(tl.float32)
-
-        for start_m in range(0, SEQ_LEN, BLOCK_M):
-            rm = start_m + tl.arange(0, BLOCK_M)
-
-            q = tl.load(
-                Q + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :],
-                mask=rm[:, None] < SEQ_LEN,
-                other=0.0,
-            ).to(tl.float32)
-
-            do = tl.load(
-                dO + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :],
-                mask=rm[:, None] < SEQ_LEN,
-                other=0.0,
-            ).to(tl.float32)
-
-            lse = tl.load(
-                L + pid_hz * SEQ_LEN + rm,
-                mask=rm < SEQ_LEN,
-                other=0.0,
-            )
-
-            # -------- PASS 1: compute Di over ALL n --------
-            Di = tl.zeros([BLOCK_M], tl.float32)
-
-            for start_n2 in range(0, SEQ_LEN, BLOCK_N):
-                rn2 = start_n2 + tl.arange(0, BLOCK_N)
-
-                k2 = tl.load(
-                    K + pid_hz * stride_kh + rn2[None, :] * stride_kn + rk[:, None] * stride_kk,
-                    mask=rn2[None, :] < SEQ_LEN,
-                    other=0.0,
-                ).to(tl.float32)
-
-                v2 = tl.load(
-                    V + pid_hz * stride_vh + rn2[:, None] * stride_vn + rk[None, :],
-                    mask=rn2[:, None] < SEQ_LEN,
-                    other=0.0,
-                ).to(tl.float32)
-
-                qk = tl.dot(q, k2) * sm_scale
-                m_tile = tl.load(
-                    mask_ptr + rm[:, None] * stride_mm + rn2[None, :] * stride_mn,
-                    mask=(rm[:, None] < SEQ_LEN) & (rn2[None, :] < SEQ_LEN),
-                    other=-float("inf"),
-                )
-                qk += m_tile
-
-                p = tl.exp(qk - lse[:, None])
-                Di += tl.sum(p * tl.dot(do, tl.trans(v2)), axis=1)
-
-            # -------- PASS 2: accumulate dk / dv --------
-            qk = tl.dot(q, tl.trans(k)) * sm_scale
-            m_tile = tl.load(
-                mask_ptr + rm[:, None] * stride_mm + rn[None, :] * stride_mn,
-                mask=(rm[:, None] < SEQ_LEN) & (rn[None, :] < SEQ_LEN),
-                other=-float("inf"),
-            )
-            qk += m_tile
-
-            p = tl.exp(qk - lse[:, None])
-
-            dv += tl.dot(tl.trans(p), do)
-
-            dp = (tl.dot(do, tl.trans(v)) - Di[:, None]) * p * sm_scale
-            dk += tl.dot(tl.trans(dp), q)
-
-        tl.store(
-            dK + pid_hz * stride_kh + rn[:, None] * stride_kn + rk[None, :],
-            dk.to(tl.float16),
-            mask=rn[:, None] < SEQ_LEN,
-        )
-        tl.store(
-            dV + pid_hz * stride_vh + rn[:, None] * stride_vn + rk[None, :],
-            dv.to(tl.float16),
-            mask=rn[:, None] < SEQ_LEN,
-        )
-
-class FlashAttentionSafe(torch.autograd.Function):
+class FlashAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, mask, sm_scale):
+        BLOCK_M, BLOCK_N = 64, 64
         B, H, S, D = q.shape
-        o = torch.empty_like(q)
-        lse = torch.empty((B * H, S), device=q.device, dtype=torch.float32)
-        mask_stride_mb, mask_stride_mh, mask_stride_mm, mask_stride_mn = mask.stride()
-        _attn_fwd_kernel[(triton.cdiv(S, 64), B * H)](
-            q, k, v, mask, sm_scale, lse, o,
-            *q.stride(), *k.stride(), *v.stride(),
-            mask_stride_mb, 0, mask_stride_mm, mask_stride_mn, *o.stride(),
-            B, H, S, D,
-            BLOCK_M=64, BLOCK_N=32,
+        out = torch.empty_like(q)
+        L = torch.empty((B, H, S), device=q.device, dtype=torch.float32)
+        grid = (triton.cdiv(S, BLOCK_M), B * H)
+        _attn_fwd_kernel[grid](
+            q, k, v, mask, sm_scale, L, out,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            mask.stride(0), mask.stride(1), mask.stride(2), mask.stride(3),
+            out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+            B, H, S, HEAD_DIM=D, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
         )
-
-        ctx.save_for_backward(q, k, v, mask, lse)
+        ctx.save_for_backward(q, k, v, mask, L, out)
         ctx.sm_scale = sm_scale
-        return o
+        return out
 
     @staticmethod
     def backward(ctx, do):
-        q, k, v, mask, lse = ctx.saved_tensors
+        q, k, v, mask, L, out = ctx.saved_tensors
         B, H, S, D = q.shape
-
-        dq = torch.empty_like(q)
-        dk = torch.empty_like(k)
-        dv = torch.empty_like(v)
-        mask_stride_mb, mask_stride_mh, mask_stride_mm, mask_stride_mn = mask.stride()
-        _attn_bwd_kernel[(B * H,)](
-            q, k, v, mask, ctx.sm_scale,
-            do, dq, dk, dv, lse,
-            *q.stride(), *k.stride(), *v.stride(), mask_stride_mb, 0, mask_stride_mm, mask_stride_mn,
-            B, H, S, D,
-            BLOCK_M=64, BLOCK_N=32,
-        )
-
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        delta = torch.empty((B, H, S), device=q.device, dtype=torch.float32)
+        BLOCK_M, BLOCK_N = 64, 64
+        grid_prep = (triton.cdiv(S, BLOCK_M), B * H)
+        _bwd_preprocess_kernel[grid_prep](out, do, delta, out.stride(0), out.stride(1), out.stride(2), out.stride(3), B, H, S, BLOCK_M=BLOCK_M, HEAD_DIM=D)
+        _bwd_kernel_dq[(triton.cdiv(S, BLOCK_M), B * H)](q, k, v, mask, ctx.sm_scale, do, dq, L, delta, q.stride(0), q.stride(1), q.stride(2), q.stride(3), k.stride(0), k.stride(1), k.stride(2), k.stride(3), mask.stride(0), mask.stride(1), mask.stride(2), mask.stride(3), B, H, S, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=D)
+        _bwd_kernel_dkdv[(triton.cdiv(S, BLOCK_N), B * H)](q, k, v, mask, ctx.sm_scale, do, dk, dv, L, delta, q.stride(0), q.stride(1), q.stride(2), q.stride(3), k.stride(0), k.stride(1), k.stride(2), k.stride(3), mask.stride(0), mask.stride(1), mask.stride(2), mask.stride(3), B, H, S, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=D)
         return dq, dk, dv, None, None
 
-# ============================================================
-# Test
-# ============================================================
-def test():
-    B, H, S, D = 1, 4, 512, 64
-    q, k, v = [
-        torch.randn((B, H, S, D), device="cuda", dtype=torch.float16, requires_grad=True)
-        for _ in range(3)
-    ]
 
-    mask = torch.tril(torch.ones((B, 1, S, S), device="cuda"))
-    mask = torch.where(mask > 0, 0.0, float("-inf")).to(torch.float16)
 
+
+def test_flash_attn_full():
+    B, H, S, D = 2, 4, 128, 64
+    dtype = torch.float16
+    device = "cuda"
+    
+    # Init inputs
+    q = torch.randn((B, H, S, D), device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn((B, H, S, D), device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn((B, H, S, D), device=device, dtype=dtype, requires_grad=True)
+    
+    # 1. Mask for Triton and Manual Ref (Explicit -inf mask)
+    mask = torch.tril(torch.ones((B, 1, S, S), device=device))
+    mask = torch.where(mask > 0, 0.0, float("-inf")).to(dtype)
+    
+    sm_scale = D**-0.5
     do = torch.randn_like(q)
-    scale = 1.0 / math.sqrt(D)
 
-    out_ref = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-    out_ref.backward(do)
-    ref_grads = [q.grad.clone(), k.grad.clone(), v.grad.clone()]
+    # --- A. TRITON ---
+    out_tri = FlashAttention.apply(q, k, v, mask, sm_scale)
+    out_tri.backward(do, retain_graph=True)
+    grads_tri = [q.grad.clone(), k.grad.clone(), v.grad.clone()]
+    q.grad, k.grad, v.grad = None, None, None
 
-    q.grad = k.grad = v.grad = None
+    # --- B. PYTORCH MANUAL REF ---
+    # Apply mask manually before softmax
+    p = torch.matmul(q, k.transpose(-2, -1)) * sm_scale
+    p += mask # Broadcasting add
+    p = torch.softmax(p.float(), dim=-1).to(dtype)
+    out_ref = torch.matmul(p, v)
+    out_ref.backward(do, retain_graph=True)
+    grads_ref = [q.grad.clone(), k.grad.clone(), v.grad.clone()]
+    q.grad, k.grad, v.grad = None, None, None
 
-    out_tri = FlashAttentionSafe.apply(q, k, v, mask, scale)
-    out_tri.backward(do)
+    # --- C. PYTORCH SDPA ---
+    # We use is_causal=True which is mathematically equivalent to the lower-triangular mask
+    out_sdpa = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True, scale=sm_scale)
+    out_sdpa.backward(do, retain_graph=True)
+    grads_sdpa = [q.grad.clone(), k.grad.clone(), v.grad.clone()]
 
-    print("Output Diff:", (out_ref - out_tri).abs().max().item())
-    print("dQ Diff:", (ref_grads[0] - q.grad).abs().max().item())
-    print("dK Diff:", (ref_grads[1] - k.grad).abs().max().item())
-    print("dV Diff:", (ref_grads[2] - v.grad).abs().max().item())
+    # --- REPORT ---
+    print(f"{'Variable':<10} | {'Triton vs Manual':<20} | {'Triton vs SDPA':<20}")
+    print("-" * 60)
+    
+    def check_diff(a, b):
+        # Allow slightly higher tolerance for backward pass due to atomic adds in GPU
+        return torch.allclose(a, b, atol=1e-2, rtol=1e-2)
 
-
-import torch
-import time
-import math
-import matplotlib.pyplot as plt
-
-# ==============================================
-# Ensure FlashAttentionSafe is imported/defined here
-# from your_flash_attention_module import FlashAttentionSafe
-# ==============================================
-
-def benchmark(batch=1, heads=8, dim=64, seq_lens=None, n_iters=20, device='cuda'):
-    if seq_lens is None:
-        seq_lens = [64, 128, 256, 512, 1024, 2048]
-
-    fwd_times = []
-    bwd_times = []
-    fwd_bwd_times = []
-    fwd_tflops = []
-    bwd_tflops = []
-
-    for S in seq_lens:
-        # -------------------------
-        # Allocate random inputs
-        # -------------------------
-        q = torch.randn((batch, heads, S, dim), device=device, dtype=torch.float16, requires_grad=True)
-        k = torch.randn_like(q)
-        v = torch.randn_like(q)
-        mask = torch.tril(torch.ones((batch, 1, S, S), device=device, dtype=torch.float16))
-        mask = torch.where(mask > 0, 0.0, float('-inf'))
-
-        scale = 1.0 / math.sqrt(dim)
-        do = torch.randn_like(q)
-
-        # -------------------------
-        # Warmup
-        # -------------------------
-        for _ in range(5):
-            out = FlashAttentionSafe.apply(q, k, v, mask, scale)
-            out.backward(do)
-            q.grad = k.grad = v.grad = None
-
-        # -------------------------
-        # Forward benchmark
-        # -------------------------
-        torch.cuda.synchronize()
-        t0 = time.time()
-        for _ in range(n_iters):
-            out = FlashAttentionSafe.apply(q, k, v, mask, scale)
-        torch.cuda.synchronize()
-        fwd_time = (time.time() - t0) / n_iters * 1000  # ms
-        fwd_times.append(fwd_time)
-
-        # -------------------------
-        # Backward benchmark (fresh forward each iteration)
-        # -------------------------
-        torch.cuda.synchronize()
-        t0 = time.time()
-        for _ in range(n_iters):
-            out = FlashAttentionSafe.apply(q, k, v, mask, scale)
-            out.backward(do)
-            q.grad = k.grad = v.grad = None
-        torch.cuda.synchronize()
-        bwd_time = (time.time() - t0) / n_iters * 1000  # ms
-        bwd_times.append(bwd_time)
-
-        # -------------------------
-        # Forward + Backward combined
-        # -------------------------
-        torch.cuda.synchronize()
-        t0 = time.time()
-        for _ in range(n_iters):
-            out = FlashAttentionSafe.apply(q, k, v, mask, scale)
-            out.backward(do)
-            q.grad = k.grad = v.grad = None
-        torch.cuda.synchronize()
-        fwd_bwd_time = (time.time() - t0) / n_iters * 1000  # ms
-        fwd_bwd_times.append(fwd_bwd_time)
-
-        # -------------------------
-        # Compute TFLOPs estimate
-        # -------------------------
-        # FLOPs: 2 * S * S * dim * heads * batch (approx for attention matmul)
-        flops = 2 * batch * heads * S * S * dim
-        fwd_tflops.append(flops / (fwd_time * 1e-3) / 1e12)
-        bwd_tflops.append(flops / (bwd_time * 1e-3) / 1e12)
-
-        print(f"Seq {S:4d} | Forward: {fwd_time:.2f} ms | Backward: {bwd_time:.2f} ms | "
-              f"Fwd TFLOPs: {fwd_tflops[-1]:.2f} | Bwd TFLOPs: {bwd_tflops[-1]:.2f}")
-
-    # -------------------------
-    # Plot timing results
-    # -------------------------
-    plt.figure(figsize=(10, 6))
-    plt.plot(seq_lens, fwd_times, 'o-', label='Forward (ms)')
-    plt.plot(seq_lens, bwd_times, 's-', label='Backward (ms)')
-    plt.plot(seq_lens, fwd_bwd_times, 'x-', label='Forward + Backward (ms)')
-    plt.xlabel('Sequence Length')
-    plt.ylabel('Time (ms)')
-    plt.title('Triton FlashAttention Benchmark')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-
-    # -------------------------
-    # Plot TFLOPs
-    # -------------------------
-    plt.figure(figsize=(10, 6))
-    plt.plot(seq_lens, fwd_tflops, 'o-', label='Forward TFLOPs')
-    plt.plot(seq_lens, bwd_tflops, 's-', label='Backward TFLOPs')
-    plt.xlabel('Sequence Length')
-    plt.ylabel('TFLOPs')
-    plt.title('Triton FlashAttention Estimated Throughput')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-
+    print(f"{'Output':<10} | {str(check_diff(out_tri, out_ref)):<20} | {str(check_diff(out_tri, out_sdpa)):<20}")
+    
+    for name, g_t, g_r, g_s in zip(['dQ', 'dK', 'dV'], grads_tri, grads_ref, grads_sdpa):
+        match_ref = check_diff(g_t, g_r)
+        match_sdpa = check_diff(g_t, g_s)
+        
+        # Calculate max absolute error for visibility
+        err_ref = (g_t - g_r).abs().max().item()
+        err_sdpa = (g_t - g_s).abs().max().item()
+        
+        print(f"{name:<10} | {str(match_ref):<5} (Err: {err_ref:.4f})   | {str(match_sdpa):<5} (Err: {err_sdpa:.4f})")
 
 if __name__ == "__main__":
-    benchmark()
+    test_flash_attn_full()
