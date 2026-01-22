@@ -1,9 +1,6 @@
 import torch
 import triton
 import triton.language as tl
-
-# --- 1. KERNELS ---
-
 @triton.jit
 def _attn_fwd_kernel(
     Q, K, V, Mask, sm_scale, L, Out,
@@ -15,12 +12,14 @@ def _attn_fwd_kernel(
     BATCH, HEADS, SEQ_LEN,
     HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
-    pid_m = tl.program_id(0)
-    pid_hz = tl.program_id(1)
+    pid_m = tl.program_id(0) # block row index in Q
+    pid_hz = tl.program_id(1) # batch*head index
+    # BLOCK_M = rows of Q we compute at once
+    # BLOCK_N = columns of K/V we load at once
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M) # row indices of Q for this block
+    rn = tl.arange(0, BLOCK_N) # column offsets in K/V
+    rk = tl.arange(0, HEAD_DIM) # head dimension indices
 
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = tl.arange(0, BLOCK_N)
-    rk = tl.arange(0, HEAD_DIM)
 
     q = tl.load(Q + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :], mask=rm[:, None] < SEQ_LEN, other=0.0).to(tl.float32)
 
@@ -35,18 +34,19 @@ def _attn_fwd_kernel(
         k = tl.load(K + pid_hz * stride_kh + cols[None, :] * stride_kn + rk[:, None] * stride_kk, mask=cols[None, :] < SEQ_LEN, other=0.0).to(tl.float32)
         v = tl.load(V + pid_hz * stride_vh + cols[:, None] * stride_vn + rk[None, :], mask=cols[:, None] < SEQ_LEN, other=0.0).to(tl.float32)
 
-        qk = tl.dot(q, k) * sm_scale
+        qk = tl.dot(q, k) * sm_scale #qk^t/scale
         m_tile = tl.load(mask_ptr + rm[:, None] * stride_mm + cols[None, :] * stride_mn, mask=(rm[:, None] < SEQ_LEN) & (cols[None, :] < SEQ_LEN), other=-float("inf"))
-        qk += m_tile
+        qk += m_tile #apply mask
 
-        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-        p = tl.exp(qk - m_ij[:, None])
+        m_ij = tl.maximum(m_i, tl.max(qk, axis=1)) #update maximum
+        p = tl.exp(qk - m_ij[:, None]) # calculate safe exp eqkij​−mij​  numerator
         l_ij = tl.sum(p, axis=1)
 
         alpha = tl.exp(m_i - m_ij)
         acc = acc * alpha[:, None] + tl.dot(p, v)
-        l_i = l_i * alpha + l_ij
-        m_i = m_ij
+        #∑​e^(qk−mij)​V+∑​e^(qk−mij)​V
+        l_i = l_i * alpha + l_ij #total softmax denominator (normalized)
+        m_i = m_ij #updated max
 
     out = acc / l_i[:, None]
     tl.store(Out + pid_hz * stride_oh + rm[:, None] * stride_om + rk[None, :], out.to(tl.float16), mask=rm[:, None] < SEQ_LEN)
