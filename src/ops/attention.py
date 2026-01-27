@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+
 @triton.jit
 def _attn_fwd_kernel(
     Q, K, V, Mask, sm_scale, L, Out,
@@ -104,8 +105,6 @@ def _bwd_kernel_dkdv(Q, K, V, Mask, sm_scale, dO, dK, dV, L, D, stride_qb, strid
     tl.store(dK + pid_hz * stride_kh + rn[:, None] * stride_kn + rk[None, :], (dk * sm_scale).to(tl.float16), mask=rn[:, None] < SEQ_LEN)
     tl.store(dV + pid_hz * stride_kh + rn[:, None] * stride_kn + rk[None, :], dv.to(tl.float16), mask=rn[:, None] < SEQ_LEN)
 
-# --- 2. WRAPPER ---
-
 class FlashAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, mask, sm_scale):
@@ -141,8 +140,6 @@ class FlashAttention(torch.autograd.Function):
         return dq, dk, dv, None, None
 
 
-
-
 def test_flash_attn_full():
     B, H, S, D = 2, 4, 128, 64
     dtype = torch.float16
@@ -153,20 +150,20 @@ def test_flash_attn_full():
     k = torch.randn((B, H, S, D), device=device, dtype=dtype, requires_grad=True)
     v = torch.randn((B, H, S, D), device=device, dtype=dtype, requires_grad=True)
     
-    # 1. Mask for Triton and Manual Ref (Explicit -inf mask)
+  
     mask = torch.tril(torch.ones((B, 1, S, S), device=device))
     mask = torch.where(mask > 0, 0.0, float("-inf")).to(dtype)
     
     sm_scale = D**-0.5
     do = torch.randn_like(q)
 
-    # --- A. TRITON ---
+    
     out_tri = FlashAttention.apply(q, k, v, mask, sm_scale)
     out_tri.backward(do, retain_graph=True)
     grads_tri = [q.grad.clone(), k.grad.clone(), v.grad.clone()]
     q.grad, k.grad, v.grad = None, None, None
 
-    # --- B. PYTORCH MANUAL REF ---
+    
     # Apply mask manually before softmax
     p = torch.matmul(q, k.transpose(-2, -1)) * sm_scale
     p += mask # Broadcasting add
@@ -176,13 +173,13 @@ def test_flash_attn_full():
     grads_ref = [q.grad.clone(), k.grad.clone(), v.grad.clone()]
     q.grad, k.grad, v.grad = None, None, None
 
-    # --- C. PYTORCH SDPA ---
+   
     # We use is_causal=True which is mathematically equivalent to the lower-triangular mask
     out_sdpa = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True, scale=sm_scale)
     out_sdpa.backward(do, retain_graph=True)
     grads_sdpa = [q.grad.clone(), k.grad.clone(), v.grad.clone()]
 
-    # --- REPORT ---
+    
     print(f"{'Variable':<10} | {'Triton vs Manual':<20} | {'Triton vs SDPA':<20}")
     print("-" * 60)
     

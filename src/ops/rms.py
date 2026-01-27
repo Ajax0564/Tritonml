@@ -1,227 +1,193 @@
 import torch
 import triton
 import triton.language as tl
-from torch import nn
-
-# Rms = (x/(sum(x)+e/n))*w
-@triton.jit
-def rms_norm_forward(
-    input_ptr,
-    output_ptr,
-    weight_ptr,
-    rstd_ptr,
-    row_stride,
-    feature_dim,
-    eps,
-    BLOCK_SIZE: tl.constexpr,
-):
-    # Map the program id to the row of input and output tensors to compute
-    row_idx = tl.program_id(0)
-    output_ptr += row_idx * row_stride
-    input_ptr += row_idx * row_stride
-
-    # ==== REDUCTION PART ====
-    # Compute variance (mean of squared values for RMS)
-    sum_of_squares = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    for block_offset in range(0, feature_dim, BLOCK_SIZE):
-        col_indices = block_offset + tl.arange(0, BLOCK_SIZE)
-        input_values = tl.load(
-            input_ptr + col_indices, mask=col_indices < feature_dim, other=0.0
-        ).to(tl.float32)
-        sum_of_squares += input_values * input_values
-        #eq to a[i] += b[i] * b[i]   for all i
-
-    variance = tl.sum(sum_of_squares, axis=0) / feature_dim
-    reciprocal_std = 1 / tl.sqrt(variance + eps)
-
-    # Store reciprocal standard deviation for backward pass
-    tl.store(rstd_ptr + row_idx, reciprocal_std)
-
-    # === POINTWISE OPS ====
-    # Normalize input and apply weight transformation
-    for block_offset in range(0, feature_dim, BLOCK_SIZE):
-        col_indices = block_offset + tl.arange(0, BLOCK_SIZE)
-        valid_mask = col_indices < feature_dim
-
-        weight_values = tl.load(weight_ptr + col_indices, mask=valid_mask)
-        input_values = tl.load(input_ptr + col_indices, mask=valid_mask, other=0.0).to(
-            tl.float32
-        )
-
-        normalized_values = input_values * reciprocal_std
-        output_values = normalized_values * weight_values
-
-        # Write final output
-        tl.store(output_ptr + col_indices, output_values, mask=valid_mask)
-
+import triton.testing
+import gc
 
 @triton.jit
-def rms_norm_backward(
-    d_out_ptr,      # Gradient of output
-    input_ptr,      # Original input X
-    weight_ptr,     # Weights W
-    rstd_ptr,       # Saved reciprocal std
-    dx_ptr,         # Output gradient for input X
-    dw_ptr,         # Global gradient for weights W
-    row_stride,
-    feature_dim,
-    BLOCK_SIZE: tl.constexpr,
+def rms_norm_forward_3d_kernel(
+    input_ptr, output_ptr, weight_ptr, rstd_ptr,
+    stride_xb, stride_xm, stride_xn,
+    stride_rb, stride_rm,
+    M, N, eps,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
-    row_idx = tl.program_id(0)
-    
-    # Adjust pointers for this row
-    d_out_ptr += row_idx * row_stride
-    input_ptr += row_idx * row_stride
-    dx_ptr += row_idx * row_stride
+    # Grid: (num_blocks_m, batch)
+    pid_m = tl.program_id(0)
+    pid_b = tl.program_id(1)
 
-    # Load reciprocal std (scalar for the row)
-    inv_std = tl.load(rstd_ptr + row_idx)
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, BLOCK_N)
+    row_mask = rows < M
 
-    # We assume BLOCK_SIZE >= feature_dim for the most optimized "Single Pass"
-    # If feature_dim is larger, this can be wrapped in a loop.
-    cols = tl.arange(0, BLOCK_SIZE)
-    mask = cols < feature_dim
+    # Batch pointers
+    batch_input_ptr = input_ptr + pid_b * stride_xb
+    batch_output_ptr = output_ptr + pid_b * stride_xb
+    batch_rstd_ptr = rstd_ptr + pid_b * stride_rb
 
-    # 1. Load everything into registers ONCE
-    do = tl.load(d_out_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    w = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    x = tl.load(input_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    # 1. RMS Reduction
+    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for n in range(0, N, BLOCK_N):
+        c = n + cols
+        mask = row_mask[:, None] & (c[None, :] < N)
+        x = tl.load(batch_input_ptr + rows[:, None] * stride_xm + c[None, :], mask=mask, other=0.0).to(tl.float32)
+        acc += tl.sum(x * x, axis=1)
 
-    # 2. Compute intermediate values
-    x_hat = x * inv_std
-    w_do = do * w
-    
-    # 3. Compute the row-sum for dx (m_sum)
-    # Using tl.sum on the register data
-    m_sum = tl.sum(w_do * x_hat, axis=0)
+    var = acc / N
+    rstd = tl.rsqrt(var + eps)
+    tl.store(batch_rstd_ptr + rows, rstd, mask=row_mask)
 
-    # 4. Compute and store dx
-    dx = inv_std * (w_do - (x_hat * m_sum / feature_dim))
-    tl.store(dx_ptr + cols, dx, mask=mask)
+    # 2. Normalize + Scale
+    for n in range(0, N, BLOCK_N):
+        c = n + cols
+        mask = row_mask[:, None] & (c[None, :] < N)
+        x = tl.load(batch_input_ptr + rows[:, None] * stride_xm + c[None, :], mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(weight_ptr + c, mask=c < N).to(tl.float32)
+        
+        y = x * rstd[:, None] * w[None, :]
+        tl.store(batch_output_ptr + rows[:, None] * stride_xm + c[None, :], y, mask=mask)
 
-    # 5. Atomic Update for weights (Accumulate across rows)
-    # This avoids storing the full M x N matrix
-    dw_local = do * x_hat
-    tl.atomic_add(dw_ptr + cols, dw_local, mask=mask)
+@triton.jit
+def rms_norm_backward_3d_kernel(
+    dY_ptr, X_ptr, W_ptr, RSTD_ptr, dX_ptr, dW_ptr,
+    stride_xb, stride_xm, stride_xn,
+    stride_rb, stride_rm,
+    M, N,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_b = tl.program_id(1)
 
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, BLOCK_N)
+    row_mask = rows < M
 
+    batch_x_ptr = X_ptr + pid_b * stride_xb
+    batch_dy_ptr = dY_ptr + pid_b * stride_xb
+    batch_dx_ptr = dX_ptr + pid_b * stride_xb
+    batch_rstd_ptr = RSTD_ptr + pid_b * stride_rb
 
-class TritonRMSNorm(torch.autograd.Function):
+    rstd = tl.load(batch_rstd_ptr + rows, mask=row_mask, other=0.0)
+
+    # Pass 1: Row-wise dot
+    row_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for n in range(0, N, BLOCK_N):
+        c = n + cols
+        mask = row_mask[:, None] & (c[None, :] < N)
+        x = tl.load(batch_x_ptr + rows[:, None] * stride_xm + c[None, :], mask=mask, other=0.0).to(tl.float32)
+        do = tl.load(batch_dy_ptr + rows[:, None] * stride_xm + c[None, :], mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(W_ptr + c, mask=c < N).to(tl.float32)
+        
+        x_hat = x * rstd[:, None]
+        row_sum += tl.sum(do * w * x_hat, axis=1)
+
+    row_sum = row_sum / N
+
+    # Pass 2: dX + dW
+    for n in range(0, N, BLOCK_N):
+        c = n + cols
+        mask = row_mask[:, None] & (c[None, :] < N)
+        x = tl.load(batch_x_ptr + rows[:, None] * stride_xm + c[None, :], mask=mask, other=0.0).to(tl.float32)
+        do = tl.load(batch_dy_ptr + rows[:, None] * stride_xm + c[None, :], mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(W_ptr + c, mask=c < N).to(tl.float32)
+        
+        x_hat = x * rstd[:, None]
+        dx = rstd[:, None] * (do * w - x_hat * row_sum[:, None])
+        tl.store(batch_dx_ptr + rows[:, None] * stride_xm + c[None, :], dx, mask=mask)
+
+        dw_local = tl.sum(do * x_hat, axis=0)
+        tl.atomic_add(dW_ptr + c, dw_local, mask=c < N)
+
+class TritonRMSNorm3D(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, eps=1e-6):
-        M, N = x.shape
-        BLOCK_SIZE = triton.next_power_of_2(N) # Simplest case
-        if BLOCK_SIZE > 65536: BLOCK_SIZE = 4096 # Tiling for large dims
-
+        B, M, N = x.shape
         y = torch.empty_like(x)
-        rstd = torch.empty(M, device=x.device, dtype=torch.float32)
-
-        rms_norm_forward[(M,)](
+        rstd = torch.empty((B, M), device=x.device, dtype=torch.float32)
+        
+        BLOCK_M, BLOCK_N = 16, 1024
+        grid = (triton.cdiv(M, BLOCK_M), B)
+        
+        rms_norm_forward_3d_kernel[grid](
             x, y, weight, rstd,
-            x.stride(0), N, eps,
-            BLOCK_SIZE=BLOCK_SIZE
+            x.stride(0), x.stride(1), x.stride(2),
+            rstd.stride(0), rstd.stride(1),
+            M, N, eps,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
         )
-
         ctx.save_for_backward(x, weight, rstd)
-        ctx.BLOCK_SIZE = BLOCK_SIZE
-        ctx.feature_dim = N
         return y
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, dy):
         x, weight, rstd = ctx.saved_tensors
-        M, N = x.shape
-        
+        B, M, N = x.shape
         dx = torch.empty_like(x)
-        # Allocate ONLY the final weight gradient size
         dw = torch.zeros_like(weight, dtype=torch.float32)
-
-        grid = (M,)
-        rms_norm_backward[grid](
-            grad_output, x, weight, rstd,
-            dx, dw,
-            x.stride(0), N,
-            BLOCK_SIZE=ctx.BLOCK_SIZE
+        
+        BLOCK_M, BLOCK_N = 16, 1024
+        grid = (triton.cdiv(M, BLOCK_M), B)
+        
+        rms_norm_backward_3d_kernel[grid](
+            dy, x, weight, rstd, dx, dw,
+            x.stride(0), x.stride(1), x.stride(2),
+            rstd.stride(0), rstd.stride(1),
+            M, N,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
         )
-
         return dx, dw.to(weight.dtype), None
 
-class PyTorchRMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
 
-    def forward(self, x):
-        # RMSNorm: (x / RMS(x)) * weight
-        rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
-        return (x / rms) * self.weight
-
-# --- Benchmark Suite ---
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=['N'],  # Feature dimension
-        x_vals=[1024 * i for i in range(1, 9)],  # 1k to 8k
-        line_arg='provider', 
-        line_vals=['triton', 'torch'],
-        line_names=['Triton', 'PyTorch Native'],
-        styles=[('blue', '-'), ('green', '-')],
-        ylabel='Execution Time (ms)',
-        plot_name='rmsnorm-performance',
-        args={'M': 4096, 'dtype': torch.float16} # Batch size 4096
-    )
-)
-def benchmark(M, N, dtype, provider):
-    device = 'cuda'
-    x = torch.randn((M, N), device=device, dtype=dtype, requires_grad=True)
-    weight = torch.randn((N,), device=device, dtype=dtype, requires_grad=True)
-    dy = torch.randn((M, N), device=device, dtype=dtype)
+def test_correctness():
+    B, M, N = 4, 64, 2048
+    dtype = torch.float32  # Use float32 for strict correctness checks
     eps = 1e-6
 
-    # Select provider
-    if provider == 'torch':
-        # Use native if available, otherwise manual reference
-        if hasattr(nn, 'RMSNorm'):
-            norm = nn.RMSNorm(N, eps=eps, device=device, dtype=dtype)
-            norm.weight.data = weight.data
-            fn = lambda: norm(x)
-        else:
-            norm = PyTorchRMSNorm(N, eps=eps).to(device).to(dtype)
-            norm.weight.data = weight.data
-            fn = lambda: norm(x)
-    else:
-        fn = lambda: TritonRMSNorm.apply(x, weight, eps)
+    # 1. Setup Input
+    x = torch.randn((B, M, N), device='cuda', dtype=dtype, requires_grad=True)
+    w = torch.randn(N, device='cuda', dtype=dtype, requires_grad=True)
+    dy = torch.randn((B, M, N), device='cuda', dtype=dtype)
 
-    # Measure Forward + Backward (Full Training Step)
-    def full_step():
-        y = fn()
-        y.backward(dy, retain_graph=True)
+    # 2. Reference (PyTorch)
+    # We use a pure torch implementation for the ground truth
+    def torch_rmsnorm(x, w, eps):
+        # RMSNorm: x * rsqrt(mean(x^2) + eps) * w
+        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+        return x * rms * w
 
-    ms, min_ms, max_ms = triton.testing.do_bench(full_step, quantiles=[0.5, 0.2, 0.8])
-    return ms, max_ms, min_ms
+    y_ref = torch_rmsnorm(x, w, eps)
+    y_ref.backward(dy)
+    
+    dx_ref = x.grad.clone()
+    dw_ref = w.grad.clone()
+    
+    # 3. Triton
+    x.grad.zero_()
+    w.grad.zero_()
+    
+    y_tri = TritonRMSNorm3D.apply(x, w, eps)
+    y_tri.backward(dy)
+    
+    dx_tri = x.grad.clone()
+    dw_tri = w.grad.clone()
 
+    # 4. Verification
+    # Check Forward
+    fwd_max_diff = (y_tri - y_ref).abs().max().item()
+    fwd_close = torch.allclose(y_tri, y_ref, atol=1e-5)
+    
+    # Check Backward dX
+    dx_max_diff = (dx_tri - dx_ref).abs().max().item()
+    dx_close = torch.allclose(dx_tri, dx_ref, atol=1e-5)
+    
+    # Check Backward dW
+    dw_max_diff = (dw_tri - dw_ref).abs().max().item()
+    dw_close = torch.allclose(dw_tri, dw_ref, atol=1e-5)
+
+    print("--- Correctness Report ---")
+    print(f"Forward: {'PASS' if fwd_close else 'FAIL'} (Max Diff: {fwd_max_diff:.2e})")
+    print(f"dX:      {'PASS' if dx_close else 'FAIL'} (Max Diff: {dx_max_diff:.2e})")
+    print(f"dW:      {'PASS' if dw_close else 'FAIL'} (Max Diff: {dw_max_diff:.2e})")
 
 if __name__ == "__main__":
-    # 1. Correctness Check
-    M, N = 128, 1024
-    x = torch.randn((M, N), device='cuda', requires_grad=True)
-    w = torch.randn((N,), device='cuda', requires_grad=True)
-    
-    # Triton result
-    y_tri = TritonRMSNorm.apply(x, w)
-    y_tri.backward(torch.ones_like(y_tri))
-    dx_tri, dw_tri = x.grad.clone(), w.grad.clone()
-    
-    # Torch result
-    x.grad, w.grad = None, None
-    rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + 1e-6)
-    y_ref = (x / rms) * w
-    y_ref.backward(torch.ones_like(y_ref))
-    dx_ref, dw_ref = x.grad.clone(), w.grad.clone()
-
-    print(f"Max Fwd Diff: {torch.max(torch.abs(y_tri - y_ref)):.2e}")
-    print(f"Max Dx Diff: {torch.max(torch.abs(dx_tri - dx_ref)):.2e}")
-    print(f"Max Dw Diff: {torch.max(torch.abs(dw_tri - dw_ref)):.2e}")
-
-    # 2. Run Benchmark
-    benchmark.run(show_plots=True, print_data=True)
+    test_correctness()

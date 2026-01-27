@@ -102,7 +102,7 @@ def fused_ce_bwd_kernel(
             tl.store(grad_start_ptr + cols, 0.0, mask=cols < n_cols)
         return
 
-    # 1. Compute LogSumExp (similar to your forward kernel)
+    # Compute LogSumExp (similar to your forward kernel)
     m_row = -float('inf')
     d_row = 0.0
     for start_col in range(0, n_cols, TILE_SIZE):
@@ -138,7 +138,7 @@ def compute_gradients_triton(grad_logits, x, weight, bias):
     M, N = grad_logits.shape
     K = x.shape[1]
     
-    # 1. grad_input (dX) = grad_logits @ weight
+    # grad_input (dX) = grad_logits @ weight
     # Dimensions: M=M, N=K, K=N
     grad_input = torch.empty_like(x)
     grid_dx = (triton.cdiv(M, 32) * triton.cdiv(K, 32),)
@@ -151,7 +151,7 @@ def compute_gradients_triton(grad_logits, x, weight, bias):
         HAS_BIAS=False, BLOCK_M=32, BLOCK_K=32, BLOCK_N=32
     )
 
-    # 2. grad_weight (dW) = grad_logits.T @ x
+    # grad_weight (dW) = grad_logits.T @ x
     # Dimensions: M=N, N=K, K=M
     grad_weight = torch.empty_like(weight)
     grid_dw = (triton.cdiv(N, 32) * triton.cdiv(K, 32),)
@@ -175,7 +175,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
         M, K = x_flat.shape
         N, _ = weight.shape
         
-        # 2. Linear Forward: MatMul(x, weight^T) + bias
+        # Linear Forward: MatMul(x, weight^T) + bias
         # Using your triton_linear logic
         logits = torch.empty((M, N), device=inputs.device, dtype=inputs.dtype)
         grid_linear = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),)
@@ -187,7 +187,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
             HAS_BIAS=bias is not None, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32
         )
 
-        # 3. Cross Entropy Forward
+        # Cross Entropy Forward
         losses = torch.empty(M, device=inputs.device, dtype=torch.float32)
         fused_ce_kernel[(M,)](logits, targets.view(-1), losses, N, ignore_index, TILE_SIZE=1024)
         
@@ -209,7 +209,7 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
         M, K = x.shape
         N = weight.shape[0]
         
-        # 1. Compute dLoss/dLogits
+        # Compute dLoss/dLogits
         grad_logits = torch.empty_like(logits)
         fused_ce_bwd_kernel[(M,)](
             logits, targets, grad_logits, 
@@ -219,10 +219,10 @@ class LinearCrossEntropyFunction(torch.autograd.Function):
         scale = grad_output / ctx.num_valid
         grad_logits *= scale
 
-        # 2. Compute dX and dW using your provided MatMul adaptation
+        # Compute dX and dW using your provided MatMul adaptation
         grad_input, grad_weight = compute_gradients_triton(grad_logits, x, weight, bias)
         
-        # 3. Compute dBias
+        # Compute dBias
         grad_bias = grad_logits.sum(0) if bias is not None else None
 
         return grad_input, grad_weight, grad_bias, None, None
@@ -250,46 +250,3 @@ class TritonLinearCrossEntropy(torch.nn.Module):
         return LinearCrossEntropyFunction.apply(
             x, self.weight, self.bias, targets, self.ignore_index
         )
-
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=['N'],  # Vocabulary Size
-        x_vals=[1024 * i for i in [1, 2, 4, 8, 16, 32, 64]],  # Sweep from 1k to 64k
-        line_arg='provider',  # The grouped values
-        line_vals=['pytorch', 'triton'],
-        line_names=['PyTorch', 'Triton (Fused)'],
-        styles=[('blue', '-'), ('green', '-')],
-        ylabel='Execution Time (ms)',
-        plot_name='Linear-CrossEntropy Performance (Batch=2048, Hidden=1024)',
-        args={'M': 2048, 'K': 1024},  # Constants
-    )
-)
-def benchmark(M, K, N, provider):
-    device = "cuda"
-    dtype = torch.float16
-    x = torch.randn((M, K), device=device, dtype=dtype, requires_grad=True)
-    w = torch.randn((N, K), device=device, dtype=dtype, requires_grad=True)
-    b = torch.randn((N,), device=device, dtype=dtype, requires_grad=True)
-    targets = torch.randint(0, N, (M,), device=device)
-    
-    quantiles = [0.5, 0.2, 0.8]
-    if provider == 'pytorch':
-        def run():
-            logits = F.linear(x, w, b)
-            loss = F.cross_entropy(logits, targets)
-            loss.backward()
-            return loss
-        ms, min_ms, max_ms = triton.testing.do_bench(run, quantiles=quantiles)
-    
-    if provider == 'triton':
-        triton_layer = LinearCrossEntropyFunction.apply
-        def run():
-            loss = triton_layer(x, w, b, targets)
-            loss.backward()
-            return loss
-        ms, min_ms, max_ms = triton.testing.do_bench(run, quantiles=quantiles)
-    
-    return ms, max_ms, min_ms
-
-if __name__ == "__main__":
-    benchmark.run(show_plots=True, print_data=True, save_path='.')
