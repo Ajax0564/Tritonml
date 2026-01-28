@@ -5,14 +5,14 @@ import triton.testing
 import gc
 
 @triton.jit
-def rms_norm_forward_3d_kernel(
+def rms_norm_forward_kernel(
     input_ptr, output_ptr, weight_ptr, rstd_ptr,
     stride_xb, stride_xm, stride_xn,
+    stride_yb, stride_ym, stride_yn,
     stride_rb, stride_rm,
     M, N, eps,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
-    # Grid: (num_blocks_m, batch)
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
 
@@ -20,9 +20,8 @@ def rms_norm_forward_3d_kernel(
     cols = tl.arange(0, BLOCK_N)
     row_mask = rows < M
 
-    # Batch pointers
     batch_input_ptr = input_ptr + pid_b * stride_xb
-    batch_output_ptr = output_ptr + pid_b * stride_xb
+    batch_output_ptr = output_ptr + pid_b * stride_yb
     batch_rstd_ptr = rstd_ptr + pid_b * stride_rb
 
     # 1. RMS Reduction
@@ -30,27 +29,29 @@ def rms_norm_forward_3d_kernel(
     for n in range(0, N, BLOCK_N):
         c = n + cols
         mask = row_mask[:, None] & (c[None, :] < N)
-        x = tl.load(batch_input_ptr + rows[:, None] * stride_xm + c[None, :], mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(batch_input_ptr + rows[:, None] * stride_xm + c[None, :] * stride_xn, mask=mask, other=0.0).to(tl.float32)
         acc += tl.sum(x * x, axis=1)
 
     var = acc / N
     rstd = tl.rsqrt(var + eps)
-    tl.store(batch_rstd_ptr + rows, rstd, mask=row_mask)
+    tl.store(batch_rstd_ptr + rows * stride_rm, rstd, mask=row_mask)
 
     # 2. Normalize + Scale
     for n in range(0, N, BLOCK_N):
         c = n + cols
         mask = row_mask[:, None] & (c[None, :] < N)
-        x = tl.load(batch_input_ptr + rows[:, None] * stride_xm + c[None, :], mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(batch_input_ptr + rows[:, None] * stride_xm + c[None, :] * stride_xn, mask=mask, other=0.0).to(tl.float32)
         w = tl.load(weight_ptr + c, mask=c < N).to(tl.float32)
         
         y = x * rstd[:, None] * w[None, :]
-        tl.store(batch_output_ptr + rows[:, None] * stride_xm + c[None, :], y, mask=mask)
+        tl.store(batch_output_ptr + rows[:, None] * stride_ym + c[None, :] * stride_yn, y, mask=mask)
 
 @triton.jit
-def rms_norm_backward_3d_kernel(
-    dY_ptr, X_ptr, W_ptr, RSTD_ptr, dX_ptr, dW_ptr,
+def rms_norm_backward_dx_kernel(
+    dY_ptr, X_ptr, W_ptr, RSTD_ptr, dX_ptr,
+    stride_dyb, stride_dym, stride_dyn,
     stride_xb, stride_xm, stride_xn,
+    stride_dxb, stride_dxm, stride_dxn,
     stride_rb, stride_rm,
     M, N,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
@@ -62,41 +63,72 @@ def rms_norm_backward_3d_kernel(
     cols = tl.arange(0, BLOCK_N)
     row_mask = rows < M
 
-    batch_x_ptr = X_ptr + pid_b * stride_xb
-    batch_dy_ptr = dY_ptr + pid_b * stride_xb
-    batch_dx_ptr = dX_ptr + pid_b * stride_xb
-    batch_rstd_ptr = RSTD_ptr + pid_b * stride_rb
+    # Batch pointers
+    b_dy_ptr = dY_ptr + pid_b * stride_dyb
+    b_x_ptr = X_ptr + pid_b * stride_xb
+    b_dx_ptr = dX_ptr + pid_b * stride_dxb
+    b_rstd_ptr = RSTD_ptr + pid_b * stride_rb
 
-    rstd = tl.load(batch_rstd_ptr + rows, mask=row_mask, other=0.0)
+    rstd = tl.load(b_rstd_ptr + rows * stride_rm, mask=row_mask, other=0.0)
 
-    # Pass 1: Row-wise dot
+    # Row-wise dot product: sum(dY * W * X * rstd)
     row_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
     for n in range(0, N, BLOCK_N):
         c = n + cols
         mask = row_mask[:, None] & (c[None, :] < N)
-        x = tl.load(batch_x_ptr + rows[:, None] * stride_xm + c[None, :], mask=mask, other=0.0).to(tl.float32)
-        do = tl.load(batch_dy_ptr + rows[:, None] * stride_xm + c[None, :], mask=mask, other=0.0).to(tl.float32)
+        
+        dy = tl.load(b_dy_ptr + rows[:, None] * stride_dym + c[None, :] * stride_dyn, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(b_x_ptr + rows[:, None] * stride_xm + c[None, :] * stride_xn, mask=mask, other=0.0).to(tl.float32)
         w = tl.load(W_ptr + c, mask=c < N).to(tl.float32)
         
-        x_hat = x * rstd[:, None]
-        row_sum += tl.sum(do * w * x_hat, axis=1)
+        row_sum += tl.sum(dy * w * x, axis=1)
 
-    row_sum = row_sum / N
+    row_sum = row_sum * (rstd * rstd * rstd / N)
 
-    # Pass 2: dX + dW
+    # Compute dX
     for n in range(0, N, BLOCK_N):
         c = n + cols
         mask = row_mask[:, None] & (c[None, :] < N)
-        x = tl.load(batch_x_ptr + rows[:, None] * stride_xm + c[None, :], mask=mask, other=0.0).to(tl.float32)
-        do = tl.load(batch_dy_ptr + rows[:, None] * stride_xm + c[None, :], mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(W_ptr + c, mask=c < N).to(tl.float32)
         
-        x_hat = x * rstd[:, None]
-        dx = rstd[:, None] * (do * w - x_hat * row_sum[:, None])
-        tl.store(batch_dx_ptr + rows[:, None] * stride_xm + c[None, :], dx, mask=mask)
+        dy = tl.load(b_dy_ptr + rows[:, None] * stride_dym + c[None, :] * stride_dyn, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(b_x_ptr + rows[:, None] * stride_xm + c[None, :] * stride_xn, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(W_ptr + c, mask=c < N).to(tl.float32)
 
-        dw_local = tl.sum(do * x_hat, axis=0)
-        tl.atomic_add(dW_ptr + c, dw_local, mask=c < N)
+        dx = dy * w * rstd[:, None] - x * row_sum[:, None]
+        tl.store(b_dx_ptr + rows[:, None] * stride_dxm + c[None, :] * stride_dxn, dx, mask=mask)
+
+@triton.jit
+def rms_norm_backward_dw_kernel(
+    dY_ptr, X_ptr, RSTD_ptr, dW_ptr,
+    stride_dyb, stride_dym, stride_dyn,
+    stride_xb, stride_xm, stride_xn,
+    stride_rb, stride_rm,
+    B, M, N,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid_n = tl.program_id(0)
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    col_mask = cols < N
+
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    for b in range(0, B):
+        b_dy_ptr = dY_ptr + b * stride_dyb
+        b_x_ptr = X_ptr + b * stride_xb
+        b_rstd_ptr = RSTD_ptr + b * stride_rb
+
+        for m in range(0, M, BLOCK_M):
+            rows = m + tl.arange(0, BLOCK_M)
+            row_mask = rows < M
+            mask = row_mask[:, None] & col_mask[None, :]
+
+            dy = tl.load(b_dy_ptr + rows[:, None] * stride_dym + cols[None, :] * stride_dyn, mask=mask, other=0.0).to(tl.float32)
+            x = tl.load(b_x_ptr + rows[:, None] * stride_xm + cols[None, :] * stride_xn, mask=mask, other=0.0).to(tl.float32)
+            rstd = tl.load(b_rstd_ptr + rows * stride_rm, mask=row_mask, other=0.0)
+
+            acc += tl.sum(dy * (x * rstd[:, None]), axis=0)
+
+    tl.store(dW_ptr + cols, acc, mask=col_mask)
 
 class TritonRMSNorm3D(torch.autograd.Function):
     @staticmethod
@@ -108,9 +140,10 @@ class TritonRMSNorm3D(torch.autograd.Function):
         BLOCK_M, BLOCK_N = 16, 1024
         grid = (triton.cdiv(M, BLOCK_M), B)
         
-        rms_norm_forward_3d_kernel[grid](
+        rms_norm_forward_kernel[grid](
             x, y, weight, rstd,
             x.stride(0), x.stride(1), x.stride(2),
+            y.stride(0), y.stride(1), y.stride(2),
             rstd.stride(0), rstd.stride(1),
             M, N, eps,
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
@@ -126,16 +159,32 @@ class TritonRMSNorm3D(torch.autograd.Function):
         dw = torch.zeros_like(weight, dtype=torch.float32)
         
         BLOCK_M, BLOCK_N = 16, 1024
-        grid = (triton.cdiv(M, BLOCK_M), B)
         
-        rms_norm_backward_3d_kernel[grid](
-            dy, x, weight, rstd, dx, dw,
+        # Kernel 1: dX
+        grid_dx = (triton.cdiv(M, BLOCK_M), B)
+        rms_norm_backward_dx_kernel[grid_dx](
+            dy, x, weight, rstd, dx,
+            dy.stride(0), dy.stride(1), dy.stride(2),
             x.stride(0), x.stride(1), x.stride(2),
+            dx.stride(0), dx.stride(1), dx.stride(2),
             rstd.stride(0), rstd.stride(1),
             M, N,
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
         )
+
+        # Kernel 2: dW
+        grid_dw = (triton.cdiv(N, BLOCK_N),)
+        rms_norm_backward_dw_kernel[grid_dw](
+            dy, x, rstd, dw,
+            dy.stride(0), dy.stride(1), dy.stride(2),
+            x.stride(0), x.stride(1), x.stride(2),
+            rstd.stride(0), rstd.stride(1),
+            B, M, N,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
+        )
+        
         return dx, dw.to(weight.dtype), None
+
 
 
 def test_correctness():

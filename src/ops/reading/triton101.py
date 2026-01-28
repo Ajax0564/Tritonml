@@ -36,6 +36,7 @@ def row_sum_kernel(
     out_ptr,      
     N,
     stride_m,
+    stride_n,
     BLOCK: tl.constexpr,
 ):
     "calculate row wise sum of a given 2d grid"
@@ -48,13 +49,13 @@ def row_sum_kernel(
     for k in range(0, tl.cdiv(N, BLOCK)):
         off_k = k * BLOCK + tl.arange(0, BLOCK)
         mask = off_k < N
-        acc += tl.load(row_ptr + off_k, mask=mask, other=0.0)
+        acc += tl.load(row_ptr + off_k*stride_n, mask=mask, other=0.0)
 
     row_sum = tl.sum(acc, axis=0)
     tl.store(out_ptr + pid, row_sum)
 
 def calculate_row_sum(M, N):
-    mat = torch.rand((M, N), device="cuda", dtype=torch.float32)
+    mat = torch.ones((M, N), device="cuda", dtype=torch.float32)
     out = torch.empty((M,), device="cuda", dtype=torch.float32)
 
     grid = (M,)
@@ -63,6 +64,7 @@ def calculate_row_sum(M, N):
         out,
         N,
         mat.stride(0),
+        mat.stride(1),
         BLOCK=4
     )
 
@@ -75,6 +77,7 @@ def row_mean_kernel(
     out_ptr,      
     N,
     stride_m,
+    stride_n,
     BLOCK: tl.constexpr,
 ):
     "calculate row wise mean of a given 2d grid"
@@ -88,7 +91,7 @@ def row_mean_kernel(
     for k in range(0, tl.cdiv(N, BLOCK)):
         off_k = k * BLOCK + tl.arange(0, BLOCK)
         mask = off_k < N
-        acc += tl.load(row_ptr + off_k, mask=mask, other=0.0)
+        acc += tl.load(row_ptr + off_k*stride_n, mask=mask, other=0.0)
 
     row_mean = tl.sum(acc, axis=0)/N
 
@@ -96,7 +99,7 @@ def row_mean_kernel(
     tl.store(out_ptr + pid, row_mean)
 
 def calculate_row_mean(M, N):
-    mat = torch.rand((M, N), device="cuda", dtype=torch.float32)
+    mat = torch.ones((M, N), device="cuda", dtype=torch.float32)
     out = torch.empty((M,), device="cuda", dtype=torch.float32)
 
     grid = (M,)
@@ -105,6 +108,7 @@ def calculate_row_mean(M, N):
         out,
         N,
         mat.stride(0),
+        mat.stride(1),
         BLOCK=4
     )
 
@@ -112,26 +116,38 @@ def calculate_row_mean(M, N):
 
 #loads each row 1 by 1 and then devide it into blocks to  calculates the sum and store it into  output row
 @triton.jit
-def row_elsum(M1_ptr,M2_ptr,out_ptr,N,stride_m1,stride_m2,stride_out,Block: tl.constexpr):
-    pid = tl.program_id(axis = 0)
-    M1_ptr+=pid*stride_m1
-    M2_ptr+=pid*stride_m2
-    out_ptr+=pid*stride_out
+def row_elsum(
+    M1_ptr, M2_ptr, out_ptr,
+    N,
+    stride_m1, stride_n1,
+    stride_m2, stride_n2,
+    stride_out1, stride_out2,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
 
-    for k in range(0,tl.cdiv(N,Block)):
-        k_ = k*Block+tl.arange(Block)
-        curr1 = tl.load(M1_ptr+k_,mask = k_<N,other = 0.0)
-        curr2 = tl.load(M2_ptr+k_,mask=k_<N,other=0.0)
+    row1_ptr = M1_ptr + pid * stride_m1
+    row2_ptr = M2_ptr + pid * stride_m2
+    row_out_ptr = out_ptr + pid * stride_out1
 
-        tl.store(out_ptr+k_,curr1+curr2,mask = k_<N)
+    for k in range(0, tl.cdiv(N, BLOCK)):
+        offs = k * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < N
+
+        x1 = tl.load(row1_ptr + offs * stride_n1, mask=mask, other=0.0)
+        x2 = tl.load(row2_ptr + offs * stride_n2, mask=mask, other=0.0)
+
+        tl.store(row_out_ptr + offs * stride_out2, x1 + x2, mask=mask)
+
     
 def calculate_elsum(M,N):
-    mat1 = torch.rand((M,N),device="cuda")
-    mat2 = torch.rand((M,N),device="cuda")
+    mat1 = torch.ones((M,N),device="cuda")
+    mat2 = torch.ones((M,N),device="cuda")
     out = torch.empty((M,N),device="cuda")
 
     grid = (M,)
-    row_elsum[grid](mat1,mat2,out,N,mat1.stride(0),mat2.stride(0),out.stride(0),32)
+    row_elsum[grid](mat1,mat2,out,N,mat1.stride(0),mat1.stride(1),mat2.stride(0),mat2.stride(1),out.stride(0),out.stride(1),32)
+    return out
 
 #load grid by grid to  calculates the sum and store it into  output grid.
 @triton.jit
