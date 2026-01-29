@@ -215,6 +215,135 @@ def matrix_multiply_kernel(
     tl.store(c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, accumulator, mask=c_mask)
 
 
+@triton.jit
+def matmul_kernel(
+    A,
+    B,
+    C,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    TILE_M: tl.constexpr,
+    TILE_N: tl.constexpr,
+    TILE_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    DIVISIBLE_M: tl.constexpr,
+    DIVISIBLE_N: tl.constexpr,
+    DIVISIBLE_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # CTA reordering (same idea as before)
+    if GROUP_M > 1:
+        grid_m = tl.num_programs(0)
+        grid_n = tl.num_programs(1)
+
+        pid = pid_m + pid_n * grid_m
+        num_cta_per_group = grid_n * GROUP_M
+
+        group_id = pid // num_cta_per_group
+        inner = pid % num_cta_per_group
+
+        group_size = tl.where(
+            (group_id * GROUP_M + GROUP_M) > grid_m,
+            grid_m % GROUP_M,
+            GROUP_M,
+        )
+
+        pid_m = group_id * GROUP_M + inner % group_size
+        pid_n = inner // group_size
+
+    offs_m = pid_m * TILE_M + tl.arange(0, TILE_M)
+    offs_n = pid_n * TILE_N + tl.arange(0, TILE_N)
+    offs_k = tl.arange(0, TILE_K)
+
+    if not DIVISIBLE_M:
+        mask_m = offs_m < M
+    if not DIVISIBLE_N:
+        mask_n = offs_n < N
+
+    a_ptrs = A + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = B + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    c_ptrs = C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+
+    acc = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
+    num_iters = tl.cdiv(K, TILE_K)
+
+    for _ in range(num_iters):
+        if DIVISIBLE_K:
+            mask_a = None if DIVISIBLE_M else mask_m[:, None]
+            mask_b = None if DIVISIBLE_N else mask_n[None, :]
+        else:
+            mask_k = offs_k < K
+            mask_a = mask_k[None, :] if DIVISIBLE_M else mask_m[:, None] & mask_k[None, :]
+            mask_b = mask_k[:, None] if DIVISIBLE_N else mask_k[:, None] & mask_n[None, :]
+
+        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=False)
+
+        offs_k += TILE_K
+        a_ptrs += TILE_K * stride_ak
+        b_ptrs += TILE_K * stride_bk
+
+    if DIVISIBLE_M and DIVISIBLE_N:
+        mask_c = None
+    elif DIVISIBLE_M:
+        mask_c = mask_n[None, :]
+    elif DIVISIBLE_N:
+        mask_c = mask_m[:, None]
+    else:
+        mask_c = mask_m[:, None] & mask_n[None, :]
+
+    tl.store(c_ptrs, acc, mask=mask_c)
+
+
+
+def triton_matmul(A, B):
+    assert A.is_cuda and B.is_cuda
+    assert A.shape[1] == B.shape[0]
+
+    M, K = A.shape
+    _, N = B.shape
+
+    C = torch.empty((M, N), device=A.device, dtype=A.dtype)
+
+    grid = lambda meta: (
+        triton.cdiv(M, meta["TILE_M"]),
+        triton.cdiv(N, meta["TILE_N"]),
+    )
+
+    matmul_kernel[grid](
+        A,
+        B,
+        C,
+        M,
+        N,
+        K,
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(1),
+        C.stride(0),
+        C.stride(1),
+        TILE_M=128,
+        TILE_N=128,
+        TILE_K=32,
+        GROUP_M=8,
+        DIVISIBLE_M=False,
+        DIVISIBLE_N=False,
+        DIVISIBLE_K=False,
+    )
+    return C
+
 #BMK@BKN -> BMN
 @triton.jit
 def batched_matmul_kernel(
@@ -288,6 +417,150 @@ def triton_bmm(a, b, BLOCK=128):
         BLOCK_M=BLOCK, BLOCK_K=BLOCK, BLOCK_N=BLOCK,
     )
     return c
+#BMK@BKN -> BMN
+@triton.jit
+def bmm_kernel(
+    A,
+    B,
+    O,
+    M,
+    N,
+    K,
+    stride_ab,
+    stride_am,
+    stride_ak,
+    stride_bb,
+    stride_bk,
+    stride_bn,
+    stride_ob,
+    stride_om,
+    stride_on,
+    TILE_M: tl.constexpr,
+    TILE_N: tl.constexpr,
+    TILE_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    DIVISIBLE_M: tl.constexpr,
+    DIVISIBLE_N: tl.constexpr,
+    DIVISIBLE_K: tl.constexpr,
+):
+    # batch id
+    pid_b = tl.program_id(2)
+    A += pid_b * stride_ab
+    B += pid_b * stride_bb
+    O += pid_b * stride_ob
+
+    pidx = tl.program_id(0)
+    pidy = tl.program_id(1)
+
+    if GROUP_M == 1:
+        pid_m, pid_n = pidx, pidy
+    else:
+        gridx = tl.num_programs(0)
+        gridy = tl.num_programs(1)
+        pid = pidx + pidy * gridx
+
+        num_cta_per_group = gridy * GROUP_M
+        group_id = pid // num_cta_per_group
+        inner = pid % num_cta_per_group
+
+        group_size = tl.where(
+            (group_id * GROUP_M + GROUP_M) > gridx,
+            gridx % GROUP_M,
+            GROUP_M,
+        )
+
+        pid_m = group_id * GROUP_M + inner % group_size
+        pid_n = inner // group_size
+
+    offs_m = pid_m * TILE_M + tl.arange(0, TILE_M)
+    offs_n = pid_n * TILE_N + tl.arange(0, TILE_N)
+    offs_k = tl.arange(0, TILE_K)
+
+    if not DIVISIBLE_M:
+        mask_m = offs_m < M
+    if not DIVISIBLE_N:
+        mask_n = offs_n < N
+
+    a_ptrs = A + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = B + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    o_ptrs = O + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+
+    acc = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
+    num_iters = tl.cdiv(K, TILE_K)
+
+    for _ in range(num_iters):
+        if DIVISIBLE_K:
+            mask_a = None if DIVISIBLE_M else mask_m[:, None]
+            mask_b = None if DIVISIBLE_N else mask_n[None, :]
+        else:
+            mask_k = offs_k < K
+            mask_a = mask_k[None, :] if DIVISIBLE_M else mask_m[:, None] & mask_k[None, :]
+            mask_b = mask_k[:, None] if DIVISIBLE_N else mask_k[:, None] & mask_n[None, :]
+
+        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+
+        acc += tl.dot(a, b, allow_tf32=False)
+
+        offs_k += TILE_K
+        a_ptrs += TILE_K * stride_ak
+        b_ptrs += TILE_K * stride_bk
+
+    if DIVISIBLE_M and DIVISIBLE_N:
+        mask_c = None
+    elif DIVISIBLE_M:
+        mask_c = mask_n[None, :]
+    elif DIVISIBLE_N:
+        mask_c = mask_m[:, None]
+    else:
+        mask_c = mask_m[:, None] & mask_n[None, :]
+
+    tl.store(o_ptrs, acc, mask=mask_c)
+
+
+
+def bmm(A, B):
+    assert A.is_cuda and B.is_cuda
+    assert A.shape[0] == B.shape[0]
+    assert A.shape[2] == B.shape[1]
+
+    batch, M, K = A.shape
+    _, _, N = B.shape
+
+    out = torch.empty((batch, M, N), device=A.device, dtype=A.dtype)
+
+    grid = lambda meta: (
+        triton.cdiv(M, meta["TILE_M"]),
+        triton.cdiv(N, meta["TILE_N"]),
+        batch,
+    )
+
+    bmm_kernel[grid](
+        A,
+        B,
+        out,
+        M,
+        N,
+        K,
+        A.stride(0),
+        A.stride(1),
+        A.stride(2),
+        B.stride(0),
+        B.stride(1),
+        B.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        TILE_M=128,
+        TILE_N=128,
+        TILE_K=32,
+        GROUP_M=8,
+        DIVISIBLE_M=False,
+        DIVISIBLE_N=False,
+        DIVISIBLE_K=False,
+    )
+
+    return out
 
 # batch matrix multiplication
 #BMK@KN -> BMN
@@ -372,6 +645,149 @@ def triton_bmk_kn(a, b, BLOCK=128):
         BLOCK_M=BLOCK, BLOCK_K=BLOCK, BLOCK_N=BLOCK,
     )
     return c
+
+
+@triton.jit
+def bmk_kn_bmn_kernel(
+    A,          # [B, M, K]
+    W,          # [K, N]
+    O,          # [B, M, N]
+    M,
+    N,
+    K,
+    stride_ab,
+    stride_am,
+    stride_ak,
+    stride_wk,
+    stride_wn,
+    stride_ob,
+    stride_om,
+    stride_on,
+    TILE_M: tl.constexpr,
+    TILE_N: tl.constexpr,
+    TILE_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    DIVISIBLE_M: tl.constexpr,
+    DIVISIBLE_N: tl.constexpr,
+    DIVISIBLE_K: tl.constexpr,
+):
+   
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_b = tl.program_id(2)
+
+    # batch offset (A and O only!)
+    A += pid_b * stride_ab
+    O += pid_b * stride_ob
+
+    # CTA reordering along M
+    if GROUP_M > 1:
+        grid_m = tl.num_programs(0)
+        grid_n = tl.num_programs(1)
+
+        pid = pid_m + pid_n * grid_m
+        num_cta_per_group = grid_n * GROUP_M
+
+        group_id = pid // num_cta_per_group
+        inner = pid % num_cta_per_group
+
+        group_size = tl.where(
+            (group_id * GROUP_M + GROUP_M) > grid_m,
+            grid_m % GROUP_M,
+            GROUP_M,
+        )
+
+        pid_m = group_id * GROUP_M + inner % group_size
+        pid_n = inner // group_size
+
+  
+    offs_m = pid_m * TILE_M + tl.arange(0, TILE_M)
+    offs_n = pid_n * TILE_N + tl.arange(0, TILE_N)
+    offs_k = tl.arange(0, TILE_K)
+
+    if not DIVISIBLE_M:
+        mask_m = offs_m < M
+    if not DIVISIBLE_N:
+        mask_n = offs_n < N
+
+
+    a_ptrs = A + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    w_ptrs = W + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn
+    o_ptrs = O + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+
+    acc = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
+    num_iters = tl.cdiv(K, TILE_K)
+
+ 
+    for _ in range(num_iters):
+        if DIVISIBLE_K:
+            mask_a = None if DIVISIBLE_M else mask_m[:, None]
+            mask_w = None if DIVISIBLE_N else mask_n[None, :]
+        else:
+            mask_k = offs_k < K
+            mask_a = mask_k[None, :] if DIVISIBLE_M else mask_m[:, None] & mask_k[None, :]
+            mask_w = mask_k[:, None] if DIVISIBLE_N else mask_k[:, None] & mask_n[None, :]
+
+        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+        w = tl.load(w_ptrs, mask=mask_w, other=0.0)
+
+        acc += tl.dot(a, w, allow_tf32=False)
+
+        offs_k += TILE_K
+        a_ptrs += TILE_K * stride_ak
+        w_ptrs += TILE_K * stride_wk
+
+ 
+    if DIVISIBLE_M and DIVISIBLE_N:
+        mask_o = None
+    elif DIVISIBLE_M:
+        mask_o = mask_n[None, :]
+    elif DIVISIBLE_N:
+        mask_o = mask_m[:, None]
+    else:
+        mask_o = mask_m[:, None] & mask_n[None, :]
+
+    tl.store(o_ptrs, acc, mask=mask_o)
+
+def triton_bmk_kn_bmn(A, W):
+    assert A.is_cuda and W.is_cuda
+    assert A.shape[2] == W.shape[0]
+
+    B, M, K = A.shape
+    _, N = W.shape
+
+    O = torch.empty((B, M, N), device=A.device, dtype=A.dtype)
+
+    grid = lambda meta: (
+        triton.cdiv(M, meta["TILE_M"]),
+        triton.cdiv(N, meta["TILE_N"]),
+        B,
+    )
+
+    bmk_kn_bmn_kernel[grid](
+        A,
+        W,
+        O,
+        M,
+        N,
+        K,
+        A.stride(0),
+        A.stride(1),
+        A.stride(2),
+        W.stride(0),
+        W.stride(1),
+        O.stride(0),
+        O.stride(1),
+        O.stride(2),
+        TILE_M=128,
+        TILE_N=128,
+        TILE_K=32,
+        GROUP_M=8,
+        DIVISIBLE_M=False,
+        DIVISIBLE_N=False,
+        DIVISIBLE_K=False,
+    )
+    return O
 
 # double matrix multiplication
 #MK@KH -> MH
