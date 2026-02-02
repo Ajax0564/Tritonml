@@ -2,8 +2,8 @@ import triton
 import triton.language as tl
 import torch
 from torch import nn
+import torch.nn.functional as F
 
-# Optimized General Purpose MatMul Kernel (Handles Bias optional)
 @triton.jit
 def matmul_kernel_fwd(
     a_ptr, b_ptr, c_ptr, bias_ptr,
@@ -173,13 +173,6 @@ class TritonLinear(nn.Module):
         return TritonLinearFunction.apply(x, self.weight, self.bias)
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-# Import your TritonLinear from the Triton script
-# from triton_linear_module import TritonLinear  # if saved in a module
-
 if __name__ == "__main__":
     torch.manual_seed(0)
     device = "cuda"
@@ -247,4 +240,4 @@ if __name__ == "__main__":
     compare("dW", triton_model.weight.grad, torch_model.weight.grad)
     compare("dBias", triton_model.bias.grad, torch_model.bias.grad)
 
-    print("\n✅ Comparison complete")
+    print("\n Comparison complete")

@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+import torch.nn.functional as F
 
 @triton.jit
 def _attn_fwd_kernel(
@@ -22,7 +23,7 @@ def _attn_fwd_kernel(
     rk = tl.arange(0, HEAD_DIM) # head dimension indices
 
 
-    q = tl.load(Q + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :], mask=rm[:, None] < SEQ_LEN, other=0.0).to(tl.float32)
+    q = tl.load(Q + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :]*stride_qk, mask=rm[:, None] < SEQ_LEN, other=0.0).to(tl.float32)
 
     m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
@@ -33,24 +34,24 @@ def _attn_fwd_kernel(
     for start_n in range(0, SEQ_LEN, BLOCK_N):
         cols = start_n + rn
         k = tl.load(K + pid_hz * stride_kh + cols[None, :] * stride_kn + rk[:, None] * stride_kk, mask=cols[None, :] < SEQ_LEN, other=0.0).to(tl.float32)
-        v = tl.load(V + pid_hz * stride_vh + cols[:, None] * stride_vn + rk[None, :], mask=cols[:, None] < SEQ_LEN, other=0.0).to(tl.float32)
+        v = tl.load(V + pid_hz * stride_vh + cols[:, None] * stride_vn + rk[None, :]*stride_vk, mask=cols[:, None] < SEQ_LEN, other=0.0).to(tl.float32)
 
         qk = tl.dot(q, k) * sm_scale #qk^t/scale
         m_tile = tl.load(mask_ptr + rm[:, None] * stride_mm + cols[None, :] * stride_mn, mask=(rm[:, None] < SEQ_LEN) & (cols[None, :] < SEQ_LEN), other=-float("inf"))
         qk += m_tile #apply mask
 
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1)) #update maximum
-        p = tl.exp(qk - m_ij[:, None]) # calculate safe exp eqkij​−mij​  numerator
+        p = tl.exp(qk - m_ij[:, None]) # calculate safe exp eqkij−mij  numerator
         l_ij = tl.sum(p, axis=1)
 
         alpha = tl.exp(m_i - m_ij)
         acc = acc * alpha[:, None] + tl.dot(p, v)
-        #∑​e^(qk−mij)​V+∑​e^(qk−mij)​V
+        #∑e^(qk−mij)V+∑e^(qk−mij)V
         l_i = l_i * alpha + l_ij #total softmax denominator (normalized)
         m_i = m_ij #updated max
 
     out = acc / l_i[:, None]
-    tl.store(Out + pid_hz * stride_oh + rm[:, None] * stride_om + rk[None, :], out.to(tl.float16), mask=rm[:, None] < SEQ_LEN)
+    tl.store(Out + pid_hz * stride_oh + rm[:, None] * stride_om + rk[None, :]*stride_ok, out.to(tl.float16), mask=rm[:, None] < SEQ_LEN)
     tl.store(L + pid_hz * SEQ_LEN + rm, m_i + tl.log(l_i), mask=rm < SEQ_LEN)
 
 @triton.jit
@@ -66,7 +67,7 @@ def _bwd_preprocess_kernel(Out, dOut, D, stride_ob, stride_oh, stride_om, stride
 def _bwd_kernel_dq(Q, K, V, Mask, sm_scale, dO, dQ, L, D, stride_qb, stride_qh, stride_qm, stride_qk, stride_kb, stride_kh, stride_kn, stride_kk, stride_mb, stride_mh, stride_mm, stride_mn, BATCH, HEADS, SEQ_LEN, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr):
     pid_m, pid_hz = tl.program_id(0), tl.program_id(1)
     rm, rk = pid_m * BLOCK_M + tl.arange(0, BLOCK_M), tl.arange(0, HEAD_DIM)
-    q = tl.load(Q + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :], mask=rm[:, None] < SEQ_LEN, other=0.0)
+    q = tl.load(Q + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :]*stride_qk, mask=rm[:, None] < SEQ_LEN, other=0.0)
     do = tl.load(dO + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :], mask=rm[:, None] < SEQ_LEN, other=0.0)
     lse = tl.load(L + pid_hz * SEQ_LEN + rm, mask=rm < SEQ_LEN)
     di = tl.load(D + pid_hz * SEQ_LEN + rm, mask=rm < SEQ_LEN)
@@ -141,7 +142,7 @@ class FlashAttention(torch.autograd.Function):
 
 
 def test_flash_attn_full():
-    B, H, S, D = 2, 4, 128, 64
+    B, H, S, D = 32, 12, 256, 64
     dtype = torch.float16
     device = "cuda"
     

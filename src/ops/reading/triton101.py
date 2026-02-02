@@ -70,6 +70,46 @@ def calculate_row_sum(M, N):
 
     return out,mat
 
+@triton.jit
+def row_sum_kernel_2(
+    m_ptr,          
+    out_ptr,      
+    M,N,
+    stride_m,
+    stride_n,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    "calculate row wise sum of a given 2d grid"
+
+    pid = tl.program_id(axis=0)
+    rows = pid * BLOCK_M+tl.arange(0, BLOCK_M)
+    acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(N, BLOCK_N)):
+        cols =  k * BLOCK_N + tl.arange(0, BLOCK_N)
+        mask = (rows[:, None]<M) & (cols[None, :] < N)
+        x = tl.load(m_ptr +rows[:, None] * stride_m + cols[None, :] * stride_n, mask=mask, other=0.0)
+        acc+=tl.sum(x,axis=1)
+    
+    tl.store(out_ptr+rows,acc,mask = rows<M)
+
+
+def calculate_row_sum_2(M, N):
+    mat = torch.ones((M, N), device="cuda", dtype=torch.float32)
+    out = torch.zeros((M,), device="cuda", dtype=torch.float32)
+
+    grid = (triton.cdiv(M, 4),)
+    row_sum_kernel_2[grid](
+        mat,
+        out,
+        M,N,
+        mat.stride(0),
+        mat.stride(1),
+        BLOCK_M=4,BLOCK_N = 4
+    )
+
+    return out,mat
+
 
 @triton.jit
 def row_mean_kernel(
@@ -497,8 +537,15 @@ def bmm_kernel(
             mask_a = mask_k[None, :] if DIVISIBLE_M else mask_m[:, None] & mask_k[None, :]
             mask_b = mask_k[:, None] if DIVISIBLE_N else mask_k[:, None] & mask_n[None, :]
 
-        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
-        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+        if mask_a is not None:
+                a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+        else:
+            a = tl.load(a_ptrs)
+
+        if mask_b is not None:
+            b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+        else:
+            b = tl.load(b_ptrs)
 
         acc += tl.dot(a, b, allow_tf32=False)
 
@@ -518,6 +565,32 @@ def bmm_kernel(
     tl.store(o_ptrs, acc, mask=mask_c)
 
 
+#bmm_1 is fast compare to bmm
+def bmm_1(A, B):
+    batch, M, K = A.shape
+    _, _, N = B.shape
+    out = torch.empty((batch, M, N), device=A.device, dtype=A.dtype)
+    div_m = M % 128 == 0
+    div_n = N % 128 == 0
+    div_k = K % 32 == 0
+    grid = lambda meta: (
+        triton.cdiv(M, meta["TILE_M"]),
+        triton.cdiv(N, meta["TILE_N"]),
+        batch,
+    )
+
+    bmm_kernel[grid](
+        A, B, out,
+        M, N, K,
+        A.stride(0), A.stride(1), A.stride(2),
+        B.stride(0), B.stride(1), B.stride(2),
+        out.stride(0), out.stride(1), out.stride(2),
+        TILE_M=128, TILE_N=128, TILE_K=32, GROUP_M=8,
+        DIVISIBLE_M=div_m,
+        DIVISIBLE_N=div_n,
+        DIVISIBLE_K=div_k
+    )
+    return out
 
 def bmm(A, B):
     assert A.is_cuda and B.is_cuda

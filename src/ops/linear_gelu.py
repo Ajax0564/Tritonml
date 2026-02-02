@@ -1,225 +1,410 @@
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
 @triton.jit
-def gelu_grad_fn(z):
-    k1 = 0.707106781  
-    k2 = 0.39894228   
-    # Use float32 for math functions to maintain stability in bfloat16
-    z_f32 = z.to(tl.float32)
-    cdf = 0.5 * (1 + tl.math.erf(k1 * z_f32))
-    pdf = k2 * tl.exp(-0.5 * z_f32 * z_f32)
-    return (cdf + z_f32 * pdf).to(z.dtype)
-
-@triton.jit
-def linear_gelu_fwd_kernel(
-    x_ptr, w_ptr, b_ptr, y_ptr, z_ptr,
-    B, M, K, N,
-    stride_xb, stride_xm, stride_xk,
-    stride_wk, stride_wn,
-    stride_yb, stride_ym, stride_yn,
-    stride_zb, stride_zm, stride_zn,
-    BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_N: tl.constexpr,
-    ADD_BIAS: tl.constexpr
+def linear_layer_gelu_fwd(
+    A,
+    B,
+    C,
+    Bias_ptr,
+    Z,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    TILE_M: tl.constexpr,
+    TILE_N: tl.constexpr,
+    TILE_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    DIVISIBLE_M: tl.constexpr,
+    DIVISIBLE_N: tl.constexpr,
+    DIVISIBLE_K: tl.constexpr,
+    ADD_BIAS: tl.constexpr,
 ):
-    pid_m, pid_n, pid_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
-    curr_x_ptr = x_ptr + pid_b * stride_xb
-    
-    # Always accumulate in float32 for precision
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # CTA reordering 
+    if GROUP_M > 1:
+        grid_m = tl.num_programs(0)
+        grid_n = tl.num_programs(1)
 
-    for k in range(0, tl.cdiv(K, BLOCK_K)):
-        offs_k = k * BLOCK_K + tl.arange(0, BLOCK_K)
-        x = tl.load(curr_x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk, 
-                    mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
-        w = tl.load(w_ptr + offs_k[:, None] * stride_wk + offs_n[None, :] * stride_wn, 
-                    mask=(offs_k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
-        
-        # input_precision set to "ieee" or None based on your earlier debugging
-        acc += tl.dot(x, w)
+        pid = pid_m + pid_n * grid_m
+        num_cta_per_group = grid_n * GROUP_M
+
+        group_id = pid // num_cta_per_group
+        inner = pid % num_cta_per_group
+
+        group_size = tl.where(
+            (group_id * GROUP_M + GROUP_M) > grid_m,
+            grid_m % GROUP_M,
+            GROUP_M,
+        )
+
+        pid_m = group_id * GROUP_M + inner % group_size
+        pid_n = inner // group_size
+
+    offs_m = pid_m * TILE_M + tl.arange(0, TILE_M)
+    offs_n = pid_n * TILE_N + tl.arange(0, TILE_N)
+    offs_k = tl.arange(0, TILE_K)
+
+    if not DIVISIBLE_M:
+        mask_m = offs_m < M
+    if not DIVISIBLE_N:
+        mask_n = offs_n < N
+
+    a_ptrs = A + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = B + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    c_ptrs = C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    z_ptrs = Z + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+
+    acc = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
+    num_iters = tl.cdiv(K, TILE_K)
+
+    for _ in range(num_iters):
+        if DIVISIBLE_K:
+            mask_a = None if DIVISIBLE_M else mask_m[:, None]
+            mask_b = None if DIVISIBLE_N else mask_n[None, :]
+        else:
+            mask_k = offs_k < K
+            mask_a = mask_k[None, :] if DIVISIBLE_M else mask_m[:, None] & mask_k[None, :]
+            mask_b = mask_k[:, None] if DIVISIBLE_N else mask_k[:, None] & mask_n[None, :]
+
+        if mask_a is not None:
+                a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+        else:
+            a = tl.load(a_ptrs)
+
+        if mask_b is not None:
+            b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+        else:
+            b = tl.load(b_ptrs)
+
+        acc += tl.dot(a, b)
+
+        offs_k += TILE_K
+        a_ptrs += TILE_K * stride_ak
+        b_ptrs += TILE_K * stride_bk
 
     if ADD_BIAS:
-        bias = tl.load(b_ptr + offs_n, mask=offs_n < N, other=0.0)
-        acc += bias[None, :].to(tl.float32)
+        if not DIVISIBLE_N:
+            bias = tl.load(Bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+        else:
+            bias = tl.load(Bias_ptr + offs_n)
+
+        acc += bias[None, :]
+
+
+    if DIVISIBLE_M and DIVISIBLE_N:
+        mask_c = None
+    elif DIVISIBLE_M:
+        mask_c = mask_n[None, :]
+    elif DIVISIBLE_N:
+        mask_c = mask_m[:, None]
+    else:
+        mask_c = mask_m[:, None] & mask_n[None, :]
     
-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(z_ptrs,acc, mask=mask_c)
     
-    # Store z (pre-activation) - cast back to input dtype
-    tl.store(z_ptr + pid_b * stride_zb + offs_m[:, None] * stride_zm + offs_n[None, :] * stride_zn, 
-             acc.to(z_ptr.dtype.element_ty), mask=mask)
+    acc = acc * 0.5 * (1.0 + tl.math.erf(acc * 0.7071067811865476))
     
-    # GELU calculation
-    output = acc * 0.5 * (1 + tl.math.erf(0.707106781 * acc))
-    
-    # Store y (post-activation) - cast back to input dtype
-    tl.store(y_ptr + pid_b * stride_yb + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn, 
-             output.to(y_ptr.dtype.element_ty), mask=mask)
+    tl.store(c_ptrs, acc, mask=mask_c)
 
 @triton.jit
-def linear_gelu_bwd_dx_kernel(
-    dy_ptr, z_ptr, w_ptr, dx_ptr,
-    B, M, K, N,
-    stride_dyb, stride_dym, stride_dyn,
-    stride_zb, stride_zm, stride_zn,
-    stride_wn, stride_wk,
-    stride_dxb, stride_dxm, stride_dxk,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
+def matmul_kernel(
+    A,
+    B,
+    C,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    TILE_M: tl.constexpr,
+    TILE_N: tl.constexpr,
+    TILE_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    DIVISIBLE_M: tl.constexpr,
+    DIVISIBLE_N: tl.constexpr,
+    DIVISIBLE_K: tl.constexpr,
 ):
-    pid_m, pid_k, pid_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    offs_m, offs_k = pid_m * BLOCK_M + tl.arange(0, BLOCK_M), pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
-    
-    acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
-    for n in range(0, tl.cdiv(N, BLOCK_N)):
-        offs_n = n * BLOCK_N + tl.arange(0, BLOCK_N)
-        mask_mn = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-        
-        dy = tl.load(dy_ptr + pid_b * stride_dyb + offs_m[:, None] * stride_dym + offs_n[None, :] * stride_dyn, mask=mask_mn, other=0.0)
-        z = tl.load(z_ptr + pid_b * stride_zb + offs_m[:, None] * stride_zm + offs_n[None, :] * stride_zn, mask=mask_mn, other=0.0)
-        
-        # Compute dz in high precision
-        dz = (dy.to(tl.float32) * gelu_grad_fn(z).to(tl.float32)).to(w_ptr.dtype.element_ty)
-        
-        w = tl.load(w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk, 
-                    mask=(offs_n[:, None] < N) & (offs_k[None, :] < K), other=0.0)
-        acc += tl.dot(dz, w)
+    # CTA reordering (same idea as before)
+    if GROUP_M > 1:
+        grid_m = tl.num_programs(0)
+        grid_n = tl.num_programs(1)
 
-    tl.store(dx_ptr + pid_b * stride_dxb + offs_m[:, None] * stride_dxm + offs_k[None, :] * stride_dxk, 
-             acc.to(dx_ptr.dtype.element_ty), mask=(offs_m[:, None] < M) & (offs_k[None, :] < K))
+        pid = pid_m + pid_n * grid_m
+        num_cta_per_group = grid_n * GROUP_M
 
-@triton.jit
-def linear_gelu_bwd_dw_kernel(
-    dy_ptr, z_ptr, x_ptr, dw_ptr,
-    B, M, K, N,
-    stride_dyb, stride_dym, stride_dyn,
-    stride_zb, stride_zm, stride_zn,
-    stride_xb, stride_xm, stride_xk,
-    stride_wn, stride_wk,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    BLOCK_B: tl.constexpr
-):
-    pid_n, pid_k, pid_b = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    offs_n, offs_k = pid_n * BLOCK_N + tl.arange(0, BLOCK_N), pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
-    
-    batch_start = pid_b * BLOCK_B
-    acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+        group_id = pid // num_cta_per_group
+        inner = pid % num_cta_per_group
 
-    for b in range(batch_start, min(batch_start + BLOCK_B, B)):
-        for m in range(0, tl.cdiv(M, BLOCK_M)):
-            offs_m = m * BLOCK_M + tl.arange(0, BLOCK_M)
-            mask_nm = (offs_n[:, None] < N) & (offs_m[None, :] < M)
-            
-            dy = tl.load(dy_ptr + b * stride_dyb + offs_m[None, :] * stride_dym + offs_n[:, None] * stride_dyn, mask=mask_nm, other=0.0)
-            z = tl.load(z_ptr + b * stride_zb + offs_m[None, :] * stride_zm + offs_n[:, None] * stride_zn, mask=mask_nm, other=0.0)
-            dz = (dy.to(tl.float32) * gelu_grad_fn(z).to(tl.float32)).to(x_ptr.dtype.element_ty)
-            
-            x = tl.load(x_ptr + b * stride_xb + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk, 
-                        mask=(offs_m[:, None] < M) & (offs_k[None, :] < K), other=0.0)
-            acc += tl.dot(dz, x)
-
-    # Atomic add must match the dtype of the pointer. 
-    # If weight is bfloat16, atomic_add in Triton 3.0+ handles it, but float32 is safer for accumulation.
-    tl.atomic_add(dw_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk, 
-                  acc.to(dw_ptr.dtype.element_ty), mask=(offs_n[:, None] < N) & (offs_k[None, :] < K))
-
-class TritonLinearGelu(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, weight, bias):
-        B, M, K = x.shape
-        N, _ = weight.shape
-        y = torch.empty((B, M, N), device=x.device, dtype=x.dtype)
-        z = torch.empty((B, M, N), device=x.device, dtype=x.dtype)
-        grid = (triton.cdiv(M, 64), triton.cdiv(N, 64), B)
-        
-        linear_gelu_fwd_kernel[grid](
-            x, weight, bias, y, z,
-            B, M, K, N,
-            x.stride(0), x.stride(1), x.stride(2),
-            weight.stride(1), weight.stride(0),
-            y.stride(0), y.stride(1), y.stride(2),
-            z.stride(0), z.stride(1), z.stride(2),
-            BLOCK_M=64, BLOCK_K=32, BLOCK_N=64,
-            ADD_BIAS=(bias is not None)
+        group_size = tl.where(
+            (group_id * GROUP_M + GROUP_M) > grid_m,
+            grid_m % GROUP_M,
+            GROUP_M,
         )
-        ctx.save_for_backward(x, weight, bias, z)
+
+        pid_m = group_id * GROUP_M + inner % group_size
+        pid_n = inner // group_size
+
+    offs_m = pid_m * TILE_M + tl.arange(0, TILE_M)
+    offs_n = pid_n * TILE_N + tl.arange(0, TILE_N)
+    offs_k = tl.arange(0, TILE_K)
+
+    if not DIVISIBLE_M:
+        mask_m = offs_m < M
+    if not DIVISIBLE_N:
+        mask_n = offs_n < N
+
+    a_ptrs = A + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = B + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    c_ptrs = C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+
+    acc = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
+    num_iters = tl.cdiv(K, TILE_K)
+
+    for _ in range(num_iters):
+        if DIVISIBLE_K:
+            mask_a = None if DIVISIBLE_M else mask_m[:, None]
+            mask_b = None if DIVISIBLE_N else mask_n[None, :]
+        else:
+            mask_k = offs_k < K
+            mask_a = mask_k[None, :] if DIVISIBLE_M else mask_m[:, None] & mask_k[None, :]
+            mask_b = mask_k[:, None] if DIVISIBLE_N else mask_k[:, None] & mask_n[None, :]
+
+        if mask_a is not None:
+                a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+        else:
+            a = tl.load(a_ptrs)
+
+        if mask_b is not None:
+            b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+        else:
+            b = tl.load(b_ptrs)
+
+        acc += tl.dot(a, b)
+
+        offs_k += TILE_K
+        a_ptrs += TILE_K * stride_ak
+        b_ptrs += TILE_K * stride_bk
+
+
+    if DIVISIBLE_M and DIVISIBLE_N:
+        mask_c = None
+    elif DIVISIBLE_M:
+        mask_c = mask_n[None, :]
+    elif DIVISIBLE_N:
+        mask_c = mask_m[:, None]
+    else:
+        mask_c = mask_m[:, None] & mask_n[None, :]
+
+    tl.store(c_ptrs, acc, mask=mask_c)
+
+
+@triton.jit
+def gelu_backward_kernel(
+    dz_ptr, dy_ptr, z_ptr,
+    M, N,
+    stride_dym, stride_dyn,
+    stride_zm, stride_zn,
+    stride_dzm, stride_dzn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    mask = (rows[:, None] < M) & (cols[None, :] < N)
+
+    dy = tl.load(dy_ptr + rows[:, None] * stride_dym + cols[None, :] * stride_dyn, mask=mask, other=0.0)
+    z  = tl.load(z_ptr  + rows[:, None] * stride_zm  + cols[None, :] * stride_zn,  mask=mask, other=0.0)
+
+    z_f = z.to(tl.float32)
+    s2i, s2pi = 0.707106781, 0.39894228
+    cdf = 0.5 * (1 + tl.math.erf(z_f * s2i))
+    pdf = s2pi * tl.exp(-0.5 * z_f * z_f)
+
+    dz = dy * (cdf + z_f * pdf)
+
+    tl.store(dz_ptr + rows[:, None] * stride_dzm + cols[None, :] * stride_dzn, dz, mask=mask)
+
+def is_div(val, tile): return val % tile == 0
+
+class TritonLinearGELU(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, w, b=None):
+        M, K = x.shape
+        K2, N = w.shape
+        assert K == K2
+
+        y = torch.empty((M, N), device=x.device, dtype=x.dtype)
+        z = torch.empty_like(y)
+
+        
+        BLOCK_M, BLOCK_N, BLOCK_K = 64,64,32
+        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+
+        linear_layer_gelu_fwd[grid](
+            x, w, y, b, z,
+            M, N, K,
+            x.stride(0), x.stride(1),
+            w.stride(0), w.stride(1),
+            y.stride(0), y.stride(1),
+            TILE_M=BLOCK_M,
+            TILE_N=BLOCK_N,
+            TILE_K=BLOCK_K,
+            GROUP_M=8,
+            DIVISIBLE_M=is_div(M, 64),
+            DIVISIBLE_N=is_div(N, 64),
+            DIVISIBLE_K=is_div(K, 32),
+            ADD_BIAS=b is not None,
+        )
+
+        ctx.save_for_backward(x, w, z)
+        ctx.has_bias = b is not None
         return y
 
     @staticmethod
     def backward(ctx, dy):
-        x, weight, bias, z = ctx.saved_tensors
-        B, M, K = x.shape
-        N, _ = weight.shape
+        x, w, z = ctx.saved_tensors
+        M, K = x.shape
+        _, N = w.shape
 
         dx = torch.empty_like(x)
-        dw = torch.zeros_like(weight)
-        db = None
+        dw = torch.empty_like(w)
+        dz = torch.empty_like(dy)
 
-        # 1. dx calculation
-        grid_dx = (triton.cdiv(M, 64), triton.cdiv(K, 64), B)
-        linear_gelu_bwd_dx_kernel[grid_dx](
-            dy, z, weight, dx, B, M, K, N,
-            dy.stride(0), dy.stride(1), dy.stride(2),
-            z.stride(0), z.stride(1), z.stride(2),
-            weight.stride(0), weight.stride(1),
-            dx.stride(0), dx.stride(1), dx.stride(2),
-            BLOCK_M=64, BLOCK_N=32, BLOCK_K=64
+        # dZ = dY * GELU'(Z) 
+        BLOCK_M, BLOCK_N = 64,64
+        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+
+        gelu_backward_kernel[grid](
+            dz, dy, z,
+            M, N,
+            dy.stride(0), dy.stride(1),
+            z.stride(0), z.stride(1),
+            dz.stride(0), dz.stride(1),
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
         )
 
-        # 2. dw calculation (Atomic)
-        BB = 4
-        grid_dw = (triton.cdiv(N, 64), triton.cdiv(K, 64), B)
-        linear_gelu_bwd_dw_kernel[grid_dw](
-            dy, z, x, dw, B, M, K, N,
-            dy.stride(0), dy.stride(1), dy.stride(2),
-            z.stride(0), z.stride(1), z.stride(2),
-            x.stride(0), x.stride(1), x.stride(2),
-            weight.stride(0), weight.stride(1),
-            BLOCK_M=32, BLOCK_N=64, BLOCK_K=64, BLOCK_B=BB
+        # dX = dZ @ W^t
+        grid_dx = (triton.cdiv(M, BLOCK_M), triton.cdiv(K, BLOCK_N))
+        matmul_kernel[grid_dx](
+            dz, w, dx,
+            M, K, N,
+            dz.stride(0), dz.stride(1),
+            w.stride(1), w.stride(0),  # Wᵀ
+            dx.stride(0), dx.stride(1),
+            TILE_M=BLOCK_M,
+            TILE_N=BLOCK_N,
+            TILE_K=32,
+            GROUP_M=8,
+            DIVISIBLE_M=is_div(M, 64),
+            DIVISIBLE_N=is_div(N, 64),
+            DIVISIBLE_K=is_div(K, 32),
         )
 
-        if bias is not None:
-            # Recompute GeLU grad for bias in PyTorch for simplicity
-            k1, k2 = 0.707106781, 0.39894228
-            cdf = 0.5 * (1 + torch.erf(k1 * z))
-            pdf = k2 * torch.exp(-0.5 * z**2)
-            dz = dy * (cdf + z * pdf)
-            db = dz.sum(dim=(0, 1))
+        #  dW = X^t @ dZ 
+        grid_dw = (triton.cdiv(K, BLOCK_M), triton.cdiv(N, BLOCK_N))
+        matmul_kernel[grid_dw](
+            x, dz, dw,
+            K, N, M,
+            x.stride(1), x.stride(0),   
+            dz.stride(0), dz.stride(1),
+            dw.stride(0), dw.stride(1),
+            TILE_M=BLOCK_M,
+            TILE_N=BLOCK_N,
+            TILE_K=32,
+            GROUP_M=8,
+            DIVISIBLE_M=is_div(M, 64),
+            DIVISIBLE_N=is_div(N, 64),
+            DIVISIBLE_K=is_div(K, 32),
+        )
+
+       
+        db = dz.sum(dim=0) if ctx.has_bias else None
 
         return dx, dw, db
 
-def test_correctness(B=4, M=128, K=256, N=512, dtype=torch.float32):
+
+def test_triton_linear_gelu_correctness():
+    torch.manual_seed(0)
     device = "cuda"
+
+    # Problem sizes (intentionally non-divisible to stress masks)
+    M, K, N = 257, 513, 769
+    dtype = torch.float32
+
+    # Inputs
+    x = torch.randn(M, K, device=device, dtype=dtype, requires_grad=True)
+    w = torch.randn(K, N, device=device, dtype=dtype, requires_grad=True)
+    b = torch.randn(N, device=device, dtype=dtype, requires_grad=True)
+
+    dy = torch.randn(M, N, device=device, dtype=dtype)
+
     
-    # High-precision reference for comparison
-    x = torch.randn((B, M, K), device=device, dtype=dtype, requires_grad=True)
-    w = torch.randn((N, K), device=device, dtype=dtype, requires_grad=True)
-    b = torch.randn((N,), device=device, dtype=dtype, requires_grad=True)
+    def torch_linear_gelu(x, w, b):
+        z = x @ w + b
+        return F.gelu(z)
 
-    # Reference
-    x_ref, w_ref, b_ref = x.detach().clone().requires_grad_(), w.detach().clone().requires_grad_(), b.detach().clone().requires_grad_()
-    y_ref = torch.nn.functional.gelu(torch.matmul(x_ref, w_ref.t()) + b_ref)
+    y_ref = torch_linear_gelu(x, w, b)
+    y_ref.backward(dy)
 
-    # Triton
-    y_triton = TritonLinearGelu.apply(x, w, b)
+    dx_ref = x.grad.detach().clone()
+    dw_ref = w.grad.detach().clone()
+    db_ref = b.grad.detach().clone()
 
-    # Tolerances for BF16/TF32
-    # BF16 typically requires ~1e-2. 
-    atol, rtol = (2e-2, 2e-2) if dtype == torch.bfloat16 else (1e-3, 1e-3)
+    # Reset grads
+    x.grad.zero_()
+    w.grad.zero_()
+    b.grad.zero_()
 
-    torch.testing.assert_close(y_triton, y_ref, atol=atol, rtol=rtol)
-    print(f"Forward Pass ({dtype}): MATCH")
+  
+    y_tri = TritonLinearGELU.apply(x, w, b)
+    y_tri.backward(dy)
 
-    dout = torch.randn_like(y_ref)
-    y_ref.backward(dout)
-    y_triton.backward(dout)
+    dx_tri = x.grad.detach()
+    dw_tri = w.grad.detach()
+    db_tri = b.grad.detach()
 
-    torch.testing.assert_close(x.grad, x_ref.grad, atol=atol, rtol=rtol)
-    torch.testing.assert_close(w.grad, w_ref.grad, atol=atol, rtol=rtol)
-    print(f"Backward Pass ({dtype}): MATCH")
+    
+    atol = 1e-4
+    rtol = 1e-4
+
+    def report(name, tri, ref):
+        max_diff = (tri - ref).abs().max().item()
+        close = torch.allclose(tri, ref, atol=atol, rtol=rtol)
+        print(f"{name:8s}: {'PASS' if close else 'FAIL'} | max diff = {max_diff:.3e}")
+        return close
+
+    print("\n--- Triton Linear + GELU Correctness ---")
+    ok_fwd = report("Forward", y_tri, y_ref)
+    ok_dx  = report("dX", dx_tri, dx_ref)
+    ok_dw  = report("dW", dw_tri, dw_ref)
+    ok_db  = report("dB", db_tri, db_ref)
+
+    assert ok_fwd and ok_dx and ok_dw and ok_db, "Correctness test failed"
+    print("All checks passed!")
+
 
 if __name__ == "__main__":
-    test_correctness()
+    test_triton_linear_gelu_correctness()

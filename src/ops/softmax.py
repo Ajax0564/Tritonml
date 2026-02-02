@@ -5,32 +5,25 @@ import triton.language as tl
 @triton.jit
 def online_softmax_kernel(
     output_ptr, input_ptr, 
-    n_rows, n_cols,
-    stride_b, stride_r,stride_c,  # Strides for input
+    M,N,
+    stride_m,stride_n, 
     BLOCK_M: tl.constexpr, TILE_SIZE: tl.constexpr
 ):
-    # Grid: (Batch, num_blocks_of_rows)
-    # Mapping: pid_batch handles the B dimension, pid_row handles the M dimension
+    
     pid_row = tl.program_id(0)
-    pid_batch = tl.program_id(1)
 
     row_offsets = pid_row * BLOCK_M + tl.arange(0, BLOCK_M)
-    row_mask = row_offsets < n_rows
-    
-    # Base pointers for this specific batch
-    batch_input_ptr = input_ptr + pid_batch * stride_b
-    batch_output_ptr = output_ptr + pid_batch * stride_b
     
     # Initialize stats for each row in the block
     m_row = tl.full([BLOCK_M], value=-float('inf'), dtype=tl.float32)
     d_row = tl.zeros([BLOCK_M], dtype=tl.float32)
     
-    # 1. Online Update Logic (Pass 1: Find Max and SumExp)
-    for start_col in range(0, n_cols, TILE_SIZE):
+    # Online way of  Max and SumExp
+    for start_col in range(0, N, TILE_SIZE):
         col_offsets = start_col + tl.arange(0, TILE_SIZE)
-        mask = row_mask[:, None] & (col_offsets[None, :] < n_cols)
+        mask = (row_offsets[:, None]<M) & (col_offsets[None, :] < N)
         
-        tile_ptr = batch_input_ptr + row_offsets[:, None] * stride_r + col_offsets[None, :]*stride_c
+        tile_ptr = input_ptr + row_offsets[:, None] * stride_m + col_offsets[None, :]*stride_n
         tile = tl.load(tile_ptr, mask=mask, other=-float('inf')).to(tl.float32)
         
         m_new = tl.max(tile, axis=1)
@@ -39,47 +32,42 @@ def online_softmax_kernel(
         d_row = d_row * alpha + tl.sum(tl.exp(tile - m_new[:, None]), axis=1)
         m_row = m_new
 
-    # 2. Normalize and Store (Pass 2)
-    for start_col in range(0, n_cols, TILE_SIZE):
+    # Normalize and Store
+    for start_col in range(0, N, TILE_SIZE):
         col_offsets = start_col + tl.arange(0, TILE_SIZE)
-        mask = row_mask[:, None] & (col_offsets[None, :] < n_cols)
+        mask = (row_offsets[:, None]<M) & (col_offsets[None, :] < N)
         
-        tile_ptr = batch_input_ptr + row_offsets[:, None] * stride_r + col_offsets[None, :]
+        tile_ptr = input_ptr + row_offsets[:, None] * stride_m + col_offsets[None, :]*stride_n
         tile = tl.load(tile_ptr, mask=mask, other=-float('inf')).to(tl.float32)
         
         output = tl.exp(tile - m_row[:, None]) / d_row[:, None]
         
-        out_ptr = batch_output_ptr + row_offsets[:, None] * stride_r + col_offsets[None, :]
+        out_ptr = output_ptr + row_offsets[:, None] * stride_m + col_offsets[None, :]*stride_n
         tl.store(out_ptr, output, mask=mask)
 
 
 @triton.jit
 def softmax_backward_kernel(
     d_out_ptr, y_ptr, dx_ptr,
-    n_rows, n_cols,
-    stride_gb, stride_gr,stride_gc,
-    stride_yb, stride_yr,stride_yc,
-    stride_xb, stride_xr,stride_xc,
+    M,N,
+    stride_gr,stride_gc,
+    stride_yr,stride_yc,
+    stride_xr,stride_xc,
     BLOCK_M: tl.constexpr, TILE_SIZE: tl.constexpr
 ):
     pid_row = tl.program_id(0)
-    pid_batch = tl.program_id(1)
+   
 
     row_offsets = pid_row * BLOCK_M + tl.arange(0, BLOCK_M)
-    row_mask = row_offsets < n_rows
-
-    batch_do_ptr = d_out_ptr + pid_batch * stride_gb
-    batch_y_ptr = y_ptr + pid_batch * stride_yb
-    batch_dx_ptr = dx_ptr + pid_batch * stride_xb
 
     # Compute sum(d_out * y) for each row in the block
     sum_dy_y = tl.zeros([BLOCK_M], dtype=tl.float32)
-    for start_col in range(0, n_cols, TILE_SIZE):
+    for start_col in range(0, N, TILE_SIZE):
         col_offsets = start_col + tl.arange(0, TILE_SIZE)
-        mask = row_mask[:, None] & (col_offsets[None, :] < n_cols)
+        mask = (row_offsets[:, None]<M) & (col_offsets[None, :] < N)
         
-        do_tile_ptr = batch_do_ptr + row_offsets[:, None] * stride_gr + col_offsets[None, :]*stride_gc
-        y_tile_ptr = batch_y_ptr + row_offsets[:, None] * stride_yr + col_offsets[None, :]*stride_yc
+        do_tile_ptr = d_out_ptr + row_offsets[:, None] * stride_gr + col_offsets[None, :]*stride_gc
+        y_tile_ptr = y_ptr + row_offsets[:, None] * stride_yr + col_offsets[None, :]*stride_yc
         
         dy_tile = tl.load(do_tile_ptr, mask=mask, other=0.0).to(tl.float32)
         y_tile = tl.load(y_tile_ptr, mask=mask, other=0.0).to(tl.float32)
@@ -87,38 +75,38 @@ def softmax_backward_kernel(
         sum_dy_y += tl.sum(dy_tile * y_tile, axis=1)
 
     # dx = y * (dy - sum_dy_y)
-    for start_col in range(0, n_cols, TILE_SIZE):
+    for start_col in range(0, N, TILE_SIZE):
         col_offsets = start_col + tl.arange(0, TILE_SIZE)
-        mask = row_mask[:, None] & (col_offsets[None, :] < n_cols)
+        mask = (row_offsets[:, None]<M) & (col_offsets[None, :] < N)
         
-        do_tile_ptr = batch_do_ptr + row_offsets[:, None] * stride_gr + col_offsets[None, :]*stride_gc
-        y_tile_ptr = batch_y_ptr + row_offsets[:, None] * stride_yr + col_offsets[None, :]*stride_yc
+        do_tile_ptr = d_out_ptr + row_offsets[:, None] * stride_gr + col_offsets[None, :]*stride_gc
+        y_tile_ptr = y_ptr + row_offsets[:, None] * stride_yr + col_offsets[None, :]*stride_yc
         
         dy_tile = tl.load(do_tile_ptr, mask=mask, other=0.0).to(tl.float32)
         y_tile = tl.load(y_tile_ptr, mask=mask, other=0.0).to(tl.float32)
         
         dx_tile = y_tile * (dy_tile - sum_dy_y[:, None])
         
-        dx_tile_ptr = batch_dx_ptr + row_offsets[:, None] * stride_xr + col_offsets[None, :]*stride_xc
+        dx_tile_ptr = dx_ptr + row_offsets[:, None] * stride_xr + col_offsets[None, :]*stride_xc
         tl.store(dx_tile_ptr, dx_tile, mask=mask)
 
 
 class TritonSoftmax(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
-        batch, n_rows, n_cols = x.shape
+        n_rows, n_cols = x.shape
         output = torch.empty_like(x)
         BLOCK_M = 16 
         TILE_SIZE = 1024
         
         # 2D Grid: (Rows / BLOCK_M, Batch)
-        grid = (triton.cdiv(n_rows, BLOCK_M), batch)
+        grid = (triton.cdiv(n_rows, BLOCK_M),)
         
         online_softmax_kernel[grid](
             output, x, n_rows, n_cols, 
-            x.stride(0), x.stride(1),x.stride(2),
+            x.stride(0), x.stride(1),
             BLOCK_M=BLOCK_M, TILE_SIZE=TILE_SIZE,
-            num_warps=8
+            num_warps=4
         )
         ctx.save_for_backward(output)
         return output
@@ -126,28 +114,28 @@ class TritonSoftmax(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         output, = ctx.saved_tensors
-        batch, n_rows, n_cols = output.shape
+        n_rows, n_cols = output.shape
         grad_input = torch.zeros_like(grad_output)
         
         BLOCK_M = 16
-        grid = (triton.cdiv(n_rows, BLOCK_M), batch)
+        grid = (triton.cdiv(n_rows, BLOCK_M),)
         
         softmax_backward_kernel[grid](
             grad_output, output, grad_input,
             n_rows, n_cols, 
-            grad_output.stride(0), grad_output.stride(1),grad_output.stride(2),
-            output.stride(0), output.stride(1),output.stride(2),
-            grad_input.stride(0), grad_input.stride(1),grad_input.stride(2),
-            BLOCK_M=BLOCK_M, TILE_SIZE=1024, num_warps=8
+            grad_output.stride(0), grad_output.stride(1),
+            output.stride(0), output.stride(1),
+            grad_input.stride(0), grad_input.stride(1),
+            BLOCK_M=BLOCK_M, TILE_SIZE=1024, num_warps=4
         )
         return grad_input
 
 
 def test_softmax():
-    BATCH, N_ROWS, N_COLS = 16, 2048,2048
-    print(f"Testing with Shape: ({BATCH}, {N_ROWS}, {N_COLS})")
+    N_ROWS, N_COLS =  2048,2048
+    print(f"Testing with Shape: ({N_ROWS}, {N_COLS})")
     
-    x = torch.randn((BATCH, N_ROWS, N_COLS), device='cuda', dtype=torch.float32, requires_grad=True)
+    x = torch.randn((N_ROWS, N_COLS), device='cuda', dtype=torch.float32, requires_grad=True)
     
     # Triton Path
     y_triton = TritonSoftmax.apply(x)
