@@ -4,11 +4,11 @@ import torch
 import torch.nn.functional as F
 # Forward pass:
 # z1 = x @ w1 + b1
-# h  = GELU(z1)
+# h  = SiLU(z1)
 # y  = h @ w2 + b2
 
 @triton.jit
-def linear_layer_gelu_fwd(
+def linear_layer_silu_fwd(
     A,
     B,
     C,
@@ -116,8 +116,8 @@ def linear_layer_gelu_fwd(
         mask_c = mask_m[:, None] & mask_n[None, :]
     
     tl.store(z_ptrs,acc, mask=mask_c)
-    
-    acc = acc * 0.5 * (1.0 + tl.math.erf(acc * 0.7071067811865476))
+
+    acc = acc * tl.sigmoid(acc)
     
     tl.store(c_ptrs, acc, mask=mask_c)
 
@@ -328,7 +328,7 @@ def matmul_kernel(
     tl.store(c_ptrs, acc, mask=mask_c)
 
 @triton.jit
-def bwd_dx_gelu_fused_kernel(
+def bwd_dx_silu_fused_kernel(
     A,
     B,
     C,
@@ -428,10 +428,10 @@ def bwd_dx_gelu_fused_kernel(
         mask_c = mask_m[:, None] & mask_n[None, :]
 
     z1 = tl.load(d_ptrs,mask = mask_c )
-    s2i, s2pi = 0.707106781, 0.39894228
-    cdf = 0.5 * (1 + tl.math.erf(z1 * s2i))
-    pdf = s2pi * tl.exp(-0.5 * z1 * z1)
-    dz1 = acc * (cdf + z1 * pdf)
+    z1_sigmoid = tl.sigmoid(z1)
+    dz1_sigmoid = z1_sigmoid*(1-z1_sigmoid)
+    
+    dz1 = acc * (z1_sigmoid+z1*dz1_sigmoid)
 
     tl.store(c_ptrs, dz1, mask=mask_c)
 
@@ -455,7 +455,7 @@ class TritonMLPFunction(torch.autograd.Function):
             triton.cdiv(H, meta["TILE_N"])
         )
 
-        linear_layer_gelu_fwd[grid1](
+        linear_layer_silu_fwd[grid1](
             x, w1, hidden, b1, z1,
             M, H, K,                 # N is H here
             x.stride(0), x.stride(1),
@@ -516,11 +516,11 @@ class TritonMLPFunction(torch.autograd.Function):
             hidden.stride(0), hidden.stride(1),
             dw2.stride(0), dw2.stride(1),
             TILE_M=64, TILE_N=64, TILE_K=32, GROUP_M=4,
-            DIVISIBLE_M=is_div(M, 64), DIVISIBLE_N=is_div(N, 64), DIVISIBLE_K=is_div(H, tile=32)
+            DIVISIBLE_M=is_div(N, 64), DIVISIBLE_N=is_div(H, 64), DIVISIBLE_K=is_div(M, tile=32)
         )
         dz1 = torch.empty_like(z1)
         grid_dz1 = grid_dw2 = lambda meta: (triton.cdiv(M, meta["TILE_M"]), triton.cdiv(H, meta["TILE_N"]))
-        bwd_dx_gelu_fused_kernel[grid_dz1](grad_output, w2, dz1, z1, M, H, N, grad_output.stride(0), grad_output.stride(1), w2.stride(0), w2.stride(1), z1.stride(0), z1.stride(1), dz1.stride(0), dz1.stride(1), TILE_M=64, TILE_N=64, TILE_K=32, GROUP_M=8,
+        bwd_dx_silu_fused_kernel[grid_dz1](grad_output, w2, dz1, z1, M, H, N, grad_output.stride(0), grad_output.stride(1), w2.stride(0), w2.stride(1), z1.stride(0), z1.stride(1), dz1.stride(0), dz1.stride(1), TILE_M=64, TILE_N=64, TILE_K=32, GROUP_M=8,
             DIVISIBLE_M=is_div(M, 64), DIVISIBLE_N=is_div(H, 64), DIVISIBLE_K=is_div(N, tile=32))
         
         dw1 = torch.empty_like(w1)
@@ -532,7 +532,7 @@ class TritonMLPFunction(torch.autograd.Function):
             x.stride(0), x.stride(1),
             dw1.stride(0), dw1.stride(1),
             TILE_M=64, TILE_N=64, TILE_K=32, GROUP_M=4,
-            DIVISIBLE_M=is_div(M, 64), DIVISIBLE_N=is_div(N, 64), DIVISIBLE_K=is_div(H, tile=32)
+            DIVISIBLE_M=is_div(H, 64), DIVISIBLE_N=is_div(K, 64), DIVISIBLE_K=is_div(M, tile=32)
         )
 
         db1 = dz1.sum(0)
@@ -593,7 +593,7 @@ def test_triton_mlp_bmk_correctness():
     w1, b1 = mlp.w1.clone().detach().requires_grad_(True), mlp.b1.clone().detach().requires_grad_(True)
     w2, b2 = mlp.w2.clone().detach().requires_grad_(True), mlp.b2.clone().detach().requires_grad_(True)
 
-    y_ref = F.linear(F.gelu(F.linear(x, w1, b1)), w2, b2)
+    y_ref = F.linear(F.silu(F.linear(x, w1, b1)), w2, b2)
     grad_output = torch.randn_like(y_ref)
     y_ref.backward(grad_output)
 

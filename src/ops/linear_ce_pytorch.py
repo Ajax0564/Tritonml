@@ -24,7 +24,7 @@ class MemoryEfficientLinearCE(torch.autograd.Function):
             t = targets[start:end]         # [c]
 
             logits = F.linear(x, weight, bias)  # [c, N]
-            lse_chunk = torch.logsumexp(logits, dim=-1)
+            lse_chunk = torch.logsumexp(logits, dim=-1) #logj∑​ezj​
 
             lse[start:end] = lse_chunk
 
@@ -74,15 +74,16 @@ class MemoryEfficientLinearCE(torch.autograd.Function):
             t = targets[start:end]
             lse_chunk = lse[start:end]
 
-            # recompute logits (checkpointing)
+            # compute logits 
             logits = F.linear(x, weight, bias)
 
-            # softmax via LSE
-            probs = torch.exp(logits - lse_chunk.unsqueeze(1))
+
+            probs = torch.exp(logits - lse_chunk.unsqueeze(1)) #softmax(z)
 
             mask = t != ignore_index
             if mask.any():
                 # subtract 1 from correct class
+                # softmaxij​−1[j=yi​]
                 probs.scatter_add_(
                     1,
                     t.clamp(min=0).unsqueeze(1),
