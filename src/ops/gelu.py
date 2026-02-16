@@ -3,18 +3,17 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def gelu_forward_kernel(
+def _gelu_forward_kernel(
     input_ptr, output_ptr,
     M, N, 
     stride_im, stride_in,
     stride_om, stride_on,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
 ):
-    # Map IDs to coordinates
+    
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
    
-    # Compute range of indices
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
@@ -23,7 +22,7 @@ def gelu_forward_kernel(
     offs_o = rm[:, None] * stride_om + rn[None, :] * stride_on
     mask = (rm[:, None] < M) & (rn[None, :] < N)
 
-    # Load, Compute, Store
+    
     x = tl.load(input_ptr + offs_i, mask=mask, other=0.0)
     
     # Exact GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
@@ -33,7 +32,7 @@ def gelu_forward_kernel(
     tl.store(output_ptr + offs_o, output, mask=mask)
 
 @triton.jit
-def gelu_backward_kernel(
+def _gelu_backward_kernel(
     grad_ptr, input_ptr, output_ptr,
     M, N,
     stride_gm, stride_gn, 
@@ -72,10 +71,10 @@ class TritonGELU(torch.autograd.Function):
         output = torch.empty_like(x)
         BLOCK_M, BLOCK_N = 32, 32
         
-        # Grid  (Num_Blocks_M, Num_Blocks_N)
+        # Grid 
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
         
-        gelu_forward_kernel[grid](
+        _gelu_forward_kernel[grid](
             input_ptr=x, output_ptr=output,
             M=M, N=N,
             stride_im=x.stride(0), stride_in=x.stride(1),
@@ -94,7 +93,7 @@ class TritonGELU(torch.autograd.Function):
         
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
         
-        gelu_backward_kernel[grid](
+        _gelu_backward_kernel[grid](
             grad_ptr=grad_output,
             input_ptr=x,
             output_ptr=grad_input,
@@ -106,25 +105,23 @@ class TritonGELU(torch.autograd.Function):
         )
         return grad_input
 
-def run_verification():
-    
-    x = torch.randn(1024, 1024, device='cuda', requires_grad=True)
-    dy = torch.randn(1024, 1024, device='cuda')
+class TritonGeluLayer(torch.nn.Module):
+    """
+    Triton GeLu activation.
+    Supports 2D and 3D inputs.
+    """
+    def __init__(self):
+        super().__init__()
 
-    # Triton path
-    y_tri = TritonGELU.apply(x)
-    y_tri.backward(dy)
-    dx_tri = x.grad.clone()
-
-    # Torch path
-    x.grad = None
-    y_ref = torch.nn.functional.gelu(x)
-    y_ref.backward(dy)
-    dx_ref = x.grad
-
-    assert torch.allclose(y_tri, y_ref, atol=1e-6), "Forward fail"
-    assert torch.allclose(dx_tri, dx_ref, atol=1e-6), "Backward fail"
-    print("Successful!")
-
-if __name__ == "__main__":
-    run_verification()
+    def forward(self, x):
+        orig_shape = x.shape
+        if x.ndim > 2:
+            x = x.view(-1, orig_shape[-1])
+            
+        y = TritonGELU.apply(x)
+        
+        # Reshape back
+        if len(orig_shape) > 2:
+            y = y.view(*orig_shape[:-1], -1)
+        return y
+        

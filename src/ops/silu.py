@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def silu_forward_kernel(
+def _silu_forward_kernel(
     input_ptr, output_ptr,
     M, N, 
     stride_im, stride_in,
@@ -30,7 +30,7 @@ def silu_forward_kernel(
     tl.store(output_ptr + offs_o, output, mask=mask)
 
 @triton.jit
-def silu_backward_kernel(
+def _silu_backward_kernel(
     grad_ptr, input_ptr, output_ptr,
     M, N,
     stride_gm, stride_gn, 
@@ -67,7 +67,7 @@ class TritonSiLU(torch.autograd.Function):
         # Grid  (Num_Blocks_M, Num_Blocks_N)
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
         
-        silu_forward_kernel[grid](
+        _silu_forward_kernel[grid](
             input_ptr=x, output_ptr=output,
             M=M, N=N,
             stride_im=x.stride(0), stride_in=x.stride(1),
@@ -86,7 +86,7 @@ class TritonSiLU(torch.autograd.Function):
         
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
         
-        silu_backward_kernel[grid](
+        _silu_backward_kernel[grid](
             grad_ptr=grad_output,
             input_ptr=x,
             output_ptr=grad_input,
@@ -98,47 +98,22 @@ class TritonSiLU(torch.autograd.Function):
         )
         return grad_input
     
-if __name__=="__main__":
-    torch.manual_seed(0)
-    device = "cuda"
-    dtype = torch.float32
+class TritonSiluLayer(torch.nn.Module):
+    """
+    Triton SiLu activation.
+    Supports 2D and 3D inputs.
+    """
+    def __init__(self):
+        super().__init__()
 
-    # Test shape
-    M, N = 257, 513
-
-    x_ref = torch.randn(M, N, device=device, dtype=dtype, requires_grad=True)
-    x_triton = x_ref.detach().clone().requires_grad_(True)
-
-  
-    y_ref = torch.functional.silu(x_ref)
-    y_triton = TritonSiLU.apply(x_triton)
-
-  
-    fwd_abs_err = (y_ref - y_triton).abs()
-    print("Forward:")
-    print("max abs err :", fwd_abs_err.max().item())
-    print("mean abs err:", fwd_abs_err.mean().item())
-
-   
-    grad_out = torch.randn_like(y_ref)
-
-    y_ref.backward(grad_out)
-    y_triton.backward(grad_out)
-
-   
-    bwd_abs_err = (x_ref.grad - x_triton.grad).abs()
-    print("Backward:")
-    print("max abs err :", bwd_abs_err.max().item())
-    print("mean abs err:", bwd_abs_err.mean().item())
-
-    
-    torch.testing.assert_close(
-        y_ref, y_triton,
-        rtol=1e-5, atol=1e-6
-    )
-    torch.testing.assert_close(
-        x_ref.grad, x_triton.grad,
-        rtol=1e-5, atol=1e-6
-    )
-
-    print("Triton SiLU matches PyTorch SiLU (forward + backward)")
+    def forward(self, x):
+        orig_shape = x.shape
+        if x.ndim > 2:
+            x = x.view(-1, orig_shape[-1])
+            
+        y = TritonSiLU.apply(x)
+        
+        # Reshape back
+        if len(orig_shape) > 2:
+            y = y.view(*orig_shape[:-1], -1)
+        return y

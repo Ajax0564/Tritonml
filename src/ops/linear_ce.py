@@ -210,32 +210,3 @@ class FusedLinearCEFunction(torch.autograd.Function):
             BLOCK_M=64, BLOCK_N=64, BLOCK_K=32
         )
         return grad_x.view(ctx.orig_shape), grad_weight, grad_bias, None, None
-
-def test():
-    torch.manual_seed(42)
-    B, T, C, V = 2, 4, 16, 32000 # Small V for precision check, set to 32000 for speed test
-    device = "cuda"
-    x = torch.randn(B, T, C, device=device, requires_grad=True)
-    targets = torch.randint(0, V, (B, T), device=device)
-    targets[0, 1] = -100
-    weight = torch.randn(V, C, device=device, requires_grad=True)
-    bias = torch.randn(V, device=device, requires_grad=True)
-
-    ref_x, ref_w, ref_b = x.detach().clone().requires_grad_(), weight.detach().clone().requires_grad_(), bias.detach().clone().requires_grad_()
-    ref_loss = F.cross_entropy(F.linear(ref_x, ref_w, ref_b).view(-1, V), targets.view(-1), ignore_index=-100)
-    
-    tri_loss = FusedLinearCEFunction.apply(x, weight, bias, targets, -100)
-    
-    print(f"Loss Diff: {torch.abs(ref_loss - tri_loss).item():.6e}")
-    ref_loss.backward(); tri_loss.backward()
-    
-    dx_diff = torch.abs(ref_x.grad - x.grad).max().item()
-    dw_diff = torch.abs(ref_w.grad - weight.grad).max().item()
-    db_diff = torch.abs(ref_b.grad - bias.grad).max().item() if bias is not None else 0
-    
-    print(f"dX Diff: {dx_diff:.6e} | dW Diff: {dw_diff:.6e} | dB Diff: {db_diff:.6e}")
-    assert dx_diff < 1e-4 and dw_diff < 1e-4
-    print(" SUCCESS: Fully fused forward and backward passed!")
-
-if __name__ == "__main__":
-    test()

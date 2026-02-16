@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def online_softmax_kernel(
+def _online_softmax_kernel(
     output_ptr, input_ptr, 
     M,N,
     stride_m,stride_n, 
@@ -14,11 +14,11 @@ def online_softmax_kernel(
 
     row_offsets = pid_row * BLOCK_M + tl.arange(0, BLOCK_M)
     
-    # Initialize stats for each row in the block
+    # Init stats for each row block
     m_row = tl.full([BLOCK_M], value=-float('inf'), dtype=tl.float32)
     d_row = tl.zeros([BLOCK_M], dtype=tl.float32)
     
-    # Online way of  Max and SumExp
+    # Online way of Max and SumExp
     for start_col in range(0, N, TILE_SIZE):
         col_offsets = start_col + tl.arange(0, TILE_SIZE)
         mask = (row_offsets[:, None]<M) & (col_offsets[None, :] < N)
@@ -27,12 +27,12 @@ def online_softmax_kernel(
         tile = tl.load(tile_ptr, mask=mask, other=-float('inf')).to(tl.float32)
         
         m_new = tl.max(tile, axis=1)
-        # Numerical stability scaling for the online sum
+       
         alpha = tl.exp(m_row - m_new)
         d_row = d_row * alpha + tl.sum(tl.exp(tile - m_new[:, None]), axis=1)
         m_row = m_new
 
-    # Normalize and Store
+    # Norm and save
     for start_col in range(0, N, TILE_SIZE):
         col_offsets = start_col + tl.arange(0, TILE_SIZE)
         mask = (row_offsets[:, None]<M) & (col_offsets[None, :] < N)
@@ -47,7 +47,7 @@ def online_softmax_kernel(
 
 
 @triton.jit
-def softmax_backward_kernel(
+def _softmax_backward_kernel(
     d_out_ptr, y_ptr, dx_ptr,
     M,N,
     stride_gr,stride_gc,
@@ -99,14 +99,13 @@ class TritonSoftmax(torch.autograd.Function):
         BLOCK_M = 16 
         TILE_SIZE = 1024
         
-        # 2D Grid: (Rows / BLOCK_M, Batch)
+        # Grid: (Rows / BLOCK_M,)
         grid = (triton.cdiv(n_rows, BLOCK_M),)
         
-        online_softmax_kernel[grid](
+        _online_softmax_kernel[grid](
             output, x, n_rows, n_cols, 
             x.stride(0), x.stride(1),
-            BLOCK_M=BLOCK_M, TILE_SIZE=TILE_SIZE,
-            num_warps=4
+            BLOCK_M=BLOCK_M, TILE_SIZE=TILE_SIZE
         )
         ctx.save_for_backward(output)
         return output
@@ -120,40 +119,12 @@ class TritonSoftmax(torch.autograd.Function):
         BLOCK_M = 16
         grid = (triton.cdiv(n_rows, BLOCK_M),)
         
-        softmax_backward_kernel[grid](
+        _softmax_backward_kernel[grid](
             grad_output, output, grad_input,
             n_rows, n_cols, 
             grad_output.stride(0), grad_output.stride(1),
             output.stride(0), output.stride(1),
             grad_input.stride(0), grad_input.stride(1),
-            BLOCK_M=BLOCK_M, TILE_SIZE=1024, num_warps=4
+            BLOCK_M=BLOCK_M, TILE_SIZE=1024
         )
         return grad_input
-
-
-def test_softmax():
-    N_ROWS, N_COLS =  2048,2048
-    print(f"Testing with Shape: ({N_ROWS}, {N_COLS})")
-    
-    x = torch.randn((N_ROWS, N_COLS), device='cuda', dtype=torch.float32, requires_grad=True)
-    
-    # Triton Path
-    y_triton = TritonSoftmax.apply(x)
-    grad_output = torch.randn_like(y_triton)
-    y_triton.backward(grad_output)
-    dx_triton = x.grad.clone()
-    
-    # Torch Path
-    x.grad.zero_()
-    y_torch = torch.softmax(x, dim=-1)
-    y_torch.backward(grad_output)
-    dx_torch = x.grad
-    
-    fwd_match = torch.allclose(y_triton, y_torch, atol=1e-6)
-    bwd_match = torch.allclose(dx_triton, dx_torch, atol=1e-6)
-    
-    print(f"Forward match: {fwd_match}")
-    print(f"Backward match: {bwd_match}")
-
-if __name__ == "__main__":
-    test_softmax()

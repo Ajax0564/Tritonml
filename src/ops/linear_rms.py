@@ -2,9 +2,10 @@ import torch
 import triton
 import triton.language as tl
 from torch.autograd import Function
+import math 
 
 @triton.jit
-def linear_kernel_fwd(
+def _linear_kernel_fwd(
     A,
     B,
     C,
@@ -21,7 +22,6 @@ def linear_kernel_fwd(
     TILE_M: tl.constexpr,
     TILE_N: tl.constexpr,
     TILE_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
     DIVISIBLE_M: tl.constexpr,
     DIVISIBLE_N: tl.constexpr,
     DIVISIBLE_K: tl.constexpr,
@@ -29,26 +29,6 @@ def linear_kernel_fwd(
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
-
-    # CTA reordering
-    if GROUP_M > 1:
-        grid_m = tl.num_programs(0)
-        grid_n = tl.num_programs(1)
-
-        pid = pid_m + pid_n * grid_m
-        num_cta_per_group = grid_n * GROUP_M
-
-        group_id = pid // num_cta_per_group
-        inner = pid % num_cta_per_group
-
-        group_size = tl.where(
-            (group_id * GROUP_M + GROUP_M) > grid_m,
-            grid_m % GROUP_M,
-            GROUP_M,
-        )
-
-        pid_m = group_id * GROUP_M + inner % group_size
-        pid_n = inner // group_size
 
     offs_m = pid_m * TILE_M + tl.arange(0, TILE_M)
     offs_n = pid_n * TILE_N + tl.arange(0, TILE_N)
@@ -111,7 +91,7 @@ def linear_kernel_fwd(
     tl.store(c_ptrs, acc, mask=mask_c)
 
 @triton.jit
-def matmul_kernel(
+def _matmul_kernel(
     A,
     B,
     C,
@@ -127,33 +107,12 @@ def matmul_kernel(
     TILE_M: tl.constexpr,
     TILE_N: tl.constexpr,
     TILE_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
     DIVISIBLE_M: tl.constexpr,
     DIVISIBLE_N: tl.constexpr,
     DIVISIBLE_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
-
-    # CTA reordering 
-    if GROUP_M > 1:
-        grid_m = tl.num_programs(0)
-        grid_n = tl.num_programs(1)
-
-        pid = pid_m + pid_n * grid_m
-        num_cta_per_group = grid_n * GROUP_M
-
-        group_id = pid // num_cta_per_group
-        inner = pid % num_cta_per_group
-
-        group_size = tl.where(
-            (group_id * GROUP_M + GROUP_M) > grid_m,
-            grid_m % GROUP_M,
-            GROUP_M,
-        )
-
-        pid_m = group_id * GROUP_M + inner % group_size
-        pid_n = inner // group_size
 
     offs_m = pid_m * TILE_M + tl.arange(0, TILE_M)
     offs_n = pid_n * TILE_N + tl.arange(0, TILE_N)
@@ -210,7 +169,7 @@ def matmul_kernel(
 
 
 @triton.jit
-def rms_norm_forward_kernel(
+def _rms_norm_forward_kernel(
     input_ptr, output_ptr, weight_ptr, rstd_ptr,
     stride_xm, stride_xn,
     stride_ym, stride_yn,
@@ -247,7 +206,7 @@ def rms_norm_forward_kernel(
         tl.store(output_ptr + rows[:, None] * stride_ym + c[None, :] * stride_yn, y, mask=mask)
 
 @triton.jit
-def rms_norm_backward_dx_kernel(
+def _rms_norm_backward_dx_kernel(
     dy_ptr, x_ptr, w_ptr, rstd_ptr, dx_ptr,
     stride_dym, stride_dyn,
     stride_xm, stride_xn,
@@ -291,7 +250,7 @@ def rms_norm_backward_dx_kernel(
         tl.store(dx_ptr + rows[:, None] * stride_dxm + c[None, :] * stride_dxn, dx, mask=mask)
 
 @triton.jit
-def rms_norm_backward_dw_kernel(
+def _rms_norm_backward_dw_kernel(
     dy_ptr, x_ptr, rstd_ptr, dw_ptr,
     stride_dym, stride_dyn,
     stride_xm, stride_xn,
@@ -325,21 +284,21 @@ class TritonLinearRMSNorm(torch.autograd.Function):
     def forward(ctx, x, w, rms_weight, b=None, eps=1e-5):
         """
         x: [M, K]
-        w: [N, K]  <-- note: keep w as NK
+        w: [N, K]  
         b: [N] or None
-        rms_weight: [N] for RMSNorm scale
+        rms_weight: [N] 
         """
         M, K = x.shape
         N, K2 = w.shape
         assert K == K2, f"Mismatch in K: x={K}, w={K2}"
 
-        # Linear output: x @ w.T
+        # x @ w.T
         y = torch.empty((M, N), device=x.device, dtype=x.dtype)
         BLOCK_M, BLOCK_N, BLOCK_K = 64,64, 32
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
-        # note the stride swap because w is [N, K]
-        linear_kernel_fwd[grid](
+        # w is [N, K]
+        _linear_kernel_fwd[grid](
             x, w, y, b,
             M, N, K,
             x.stride(0), x.stride(1),
@@ -348,7 +307,6 @@ class TritonLinearRMSNorm(torch.autograd.Function):
             TILE_M=BLOCK_M,
             TILE_N=BLOCK_N,
             TILE_K=BLOCK_K,
-            GROUP_M=8,
             DIVISIBLE_M=False,
             DIVISIBLE_N=False,
             DIVISIBLE_K=False,
@@ -358,7 +316,7 @@ class TritonLinearRMSNorm(torch.autograd.Function):
         # RMSNorm output
         z = torch.empty_like(y)
         rstd = torch.empty((M,), device=x.device, dtype=x.dtype)
-        rms_norm_forward_kernel[(triton.cdiv(M, BLOCK_M),)](
+        _rms_norm_forward_kernel[(triton.cdiv(M, BLOCK_M),)](
             y, z, rms_weight, rstd,
             y.stride(0), y.stride(1),
             z.stride(0), z.stride(1),
@@ -378,12 +336,12 @@ class TritonLinearRMSNorm(torch.autograd.Function):
         M, K = x.shape
         N, _ = w.shape
 
-        # Step 1: Backprop through RMSNorm to get dY (gradient of Linear output)
+        #  dY
         dy = torch.empty_like(y)
         BLOCK_M, BLOCK_N = 64, 64
         
-        # Use a dedicated RMSNorm backward kernel (calculates dY from dZ)
-        rms_norm_backward_dx_kernel[(triton.cdiv(M, BLOCK_M),)](
+        # 
+        _rms_norm_backward_dx_kernel[(triton.cdiv(M, BLOCK_M),)](
             dz, y, rms_weight, rstd, dy,
             dz.stride(0), dz.stride(1),
             y.stride(0), y.stride(1),
@@ -393,38 +351,38 @@ class TritonLinearRMSNorm(torch.autograd.Function):
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
         )
 
-        # Step 2: Linear backward dX = dy @ w  (Size: [M, N] @ [N, K] -> [M, K])
+        #  [M, N] @ [N, K] -> [M, K])
         dx = torch.empty_like(x)
         grid_dx = (triton.cdiv(M, BLOCK_M), triton.cdiv(K, BLOCK_N))
-        matmul_kernel[grid_dx](
+        _matmul_kernel[grid_dx](
             dy, w, dx,
             M, K, N,
             dy.stride(0), dy.stride(1),
             w.stride(0), w.stride(1),
             dx.stride(0), dx.stride(1),
             TILE_M=BLOCK_M, TILE_N=BLOCK_N, TILE_K=32,
-            GROUP_M=8, DIVISIBLE_M=False, DIVISIBLE_N=False, DIVISIBLE_K=False,
+             DIVISIBLE_M=False, DIVISIBLE_N=False, DIVISIBLE_K=False,
         )
 
-        # Step 3: Linear backward dW = dy.T @ x (Size: [N, M] @ [M, K] -> [N, K])
+        #  [N, M] @ [M, K] -> [N, K])
         dw = torch.empty_like(w)
         grid_dw = (triton.cdiv(N, BLOCK_M), triton.cdiv(K, BLOCK_N))
-        matmul_kernel[grid_dw](
+        _matmul_kernel[grid_dw](
             dy, x, dw,
             N, K, M,
             dy.stride(1), dy.stride(0), # Transpose dy: [N, M]
             x.stride(0), x.stride(1),   # x: [M, K]
             dw.stride(0), dw.stride(1),
             TILE_M=BLOCK_M, TILE_N=BLOCK_N, TILE_K=32,
-            GROUP_M=8, DIVISIBLE_M=False, DIVISIBLE_N=False, DIVISIBLE_K=False,
+            DIVISIBLE_M=False, DIVISIBLE_N=False, DIVISIBLE_K=False,
         )
 
-        # Step 4: Bias grad dB = sum(dy) over rows
+        #  dB = sum(dy) 
         db = dy.sum(dim=0) if ctx.has_bias else None
 
-        # Step 5: RMSNorm weight grad drms
+        # weight grad 
         drms = torch.empty_like(rms_weight)
-        rms_norm_backward_dw_kernel[(triton.cdiv(N, BLOCK_N),)](
+        _rms_norm_backward_dw_kernel[(triton.cdiv(N, BLOCK_N),)](
             dz, y, rstd, drms,
             dz.stride(0), dz.stride(1),
             y.stride(0), y.stride(1),
@@ -434,47 +392,59 @@ class TritonLinearRMSNorm(torch.autograd.Function):
         )
 
         return dx, dw, drms, db, None
-# ---------------- Reference PyTorch function ----------------
-def reference_linear_rmsnorm(x, w, gamma, b=None, eps=1e-5):
-    # x: [M,K], w: [N,K]
-    y = x @ w.T
-    if b is not None:
-        y = y + b
-    rstd = (y.pow(2).mean(dim=1, keepdim=True) + eps).rsqrt()
-    z = y * rstd * gamma
-    return z
 
+class TritonLinearRMSNormLayer(torch.nn.Module):
+    def __init__(self, in_features, out_features, bias=True, eps=1e-5, device=None, dtype=None):
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.eps = eps
 
-# ---------------- Test function ----------------
-def test_correctness():
-    M, K, N = 128, 512, 512
-    device, dtype = "cuda", torch.float32
-    torch.manual_seed(42)
-    
-    x = torch.randn(M, K, device=device, dtype=dtype, requires_grad=True)
-    w = torch.randn(N, K, device=device, dtype=dtype, requires_grad=True)  # w = [N, K]
-    gamma = torch.randn(N, device=device, dtype=dtype, requires_grad=True)
-    bias = torch.randn(N, device=device, dtype=dtype, requires_grad=True)
+        self.weight = torch.nn.Parameter(torch.empty((out_features, in_features), **factory_kwargs))
+        
+        if bias:
+            self.bias = torch.nn.Parameter(torch.empty(out_features, **factory_kwargs))
+        else:
+            self.register_parameter('bias', None)
 
-    # --- Triton ---
-    z_triton = TritonLinearRMSNorm.apply(x, w, gamma, bias)
-    z_triton.backward(torch.ones_like(z_triton))
-    grads_triton = [x.grad.clone(), w.grad.clone(), gamma.grad.clone(), bias.grad.clone()]
-    
-    x.grad, w.grad, gamma.grad, bias.grad = None, None, None, None
-    
-    # --- Reference ---
-    z_ref = reference_linear_rmsnorm(x, w, gamma, bias)
-    z_ref.backward(torch.ones_like(z_ref))
-    grads_ref = [x.grad.clone(), w.grad.clone(), gamma.grad.clone(), bias.grad.clone()]
-    
-    # Check results
-    print(f"Forward Match:  {torch.allclose(z_triton, z_ref, atol=1e-2)}")
-    labels = ["X", "W", "G", "B"]
-    for i, label in enumerate(labels):
-        match = torch.allclose(grads_triton[i], grads_ref[i], atol=1e-2, rtol=1e-2)
-        max_diff = (grads_triton[i] - grads_ref[i]).abs().max()
-        print(f"Grad {label} Match:   {match} (Max Diff: {max_diff:.4f})")
+        
+        self.rms_weight = torch.nn.Parameter(torch.empty(out_features, **factory_kwargs))
 
-if __name__ == "__main__":
-    test_correctness()
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        # Standard Kaiming initialization for Linear
+        torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            torch.nn.init.uniform_(self.bias, -bound, bound)
+        
+        # Initialize RMSNorm weight to ones
+        torch.nn.init.ones_(self.rms_weight)
+
+    def forward(self, x):
+        """
+        Input x: [*, in_features]
+        """
+       
+        orig_shape = x.shape
+        if x.dim() > 2:
+            x = x.view(-1, orig_shape[-1])
+
+    
+        out = TritonLinearRMSNorm.apply(
+            x, 
+            self.weight, 
+            self.rms_weight, 
+            self.bias, 
+            self.eps
+        )
+
+        # Restore original shape
+        if len(orig_shape) > 2:
+            output_shape = list(orig_shape[:-1]) + [self.out_features]
+            out = out.view(*output_shape)
+            
+        return out

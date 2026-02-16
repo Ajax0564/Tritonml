@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 
 
-class MemoryEfficientLinearCE(torch.autograd.Function):
+class EfficientLinearCE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, inputs, weight, bias, targets,
                 chunk_size=256, ignore_index=-100):
@@ -104,14 +104,14 @@ class MemoryEfficientLinearCE(torch.autograd.Function):
 
         return grad_input, grad_weight, grad_bias, None, None, None
         
-class MemoryEfficientLinearCEModule(torch.nn.Module):
+class LinearCELayer(torch.nn.Module):
     def __init__(self, chunk_size=256, ignore_index=-100):
         super().__init__()
         self.chunk_size = chunk_size
         self.ignore_index = ignore_index
 
     def forward(self, inputs, weight, bias, targets):
-        return MemoryEfficientLinearCE.apply(
+        return EfficientLinearCE.apply(
             inputs, weight, bias, targets,
             self.chunk_size, self.ignore_index
         )

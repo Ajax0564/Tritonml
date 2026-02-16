@@ -4,7 +4,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def linear_layer_gelu_fwd(
+def _linear_layer_gelu_fwd(
     A,
     B,
     C,
@@ -22,7 +22,6 @@ def linear_layer_gelu_fwd(
     TILE_M: tl.constexpr,
     TILE_N: tl.constexpr,
     TILE_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
     DIVISIBLE_M: tl.constexpr,
     DIVISIBLE_N: tl.constexpr,
     DIVISIBLE_K: tl.constexpr,
@@ -30,26 +29,6 @@ def linear_layer_gelu_fwd(
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
-
-    # CTA reordering 
-    if GROUP_M > 1:
-        grid_m = tl.num_programs(0)
-        grid_n = tl.num_programs(1)
-
-        pid = pid_m + pid_n * grid_m
-        num_cta_per_group = grid_n * GROUP_M
-
-        group_id = pid // num_cta_per_group
-        inner = pid % num_cta_per_group
-
-        group_size = tl.where(
-            (group_id * GROUP_M + GROUP_M) > grid_m,
-            grid_m % GROUP_M,
-            GROUP_M,
-        )
-
-        pid_m = group_id * GROUP_M + inner % group_size
-        pid_n = inner // group_size
 
     offs_m = pid_m * TILE_M + tl.arange(0, TILE_M)
     offs_n = pid_n * TILE_N + tl.arange(0, TILE_N)
@@ -118,7 +97,7 @@ def linear_layer_gelu_fwd(
     tl.store(c_ptrs, acc, mask=mask_c)
 
 @triton.jit
-def matmul_kernel(
+def _matmul_kernel(
     A,
     B,
     C,
@@ -134,33 +113,12 @@ def matmul_kernel(
     TILE_M: tl.constexpr,
     TILE_N: tl.constexpr,
     TILE_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
     DIVISIBLE_M: tl.constexpr,
     DIVISIBLE_N: tl.constexpr,
     DIVISIBLE_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
-
-    # CTA reordering (same idea as before)
-    if GROUP_M > 1:
-        grid_m = tl.num_programs(0)
-        grid_n = tl.num_programs(1)
-
-        pid = pid_m + pid_n * grid_m
-        num_cta_per_group = grid_n * GROUP_M
-
-        group_id = pid // num_cta_per_group
-        inner = pid % num_cta_per_group
-
-        group_size = tl.where(
-            (group_id * GROUP_M + GROUP_M) > grid_m,
-            grid_m % GROUP_M,
-            GROUP_M,
-        )
-
-        pid_m = group_id * GROUP_M + inner % group_size
-        pid_n = inner // group_size
 
     offs_m = pid_m * TILE_M + tl.arange(0, TILE_M)
     offs_n = pid_n * TILE_N + tl.arange(0, TILE_N)
@@ -217,7 +175,7 @@ def matmul_kernel(
 
 
 @triton.jit
-def gelu_backward_kernel(
+def _gelu_backward_kernel(
     dz_ptr, dy_ptr, z_ptr,
     M, N,
     stride_dym, stride_dyn,
@@ -262,7 +220,7 @@ class TritonLinearGELU(torch.autograd.Function):
         BLOCK_M, BLOCK_N, BLOCK_K = 64,64,32
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
-        linear_layer_gelu_fwd[grid](
+        _linear_layer_gelu_fwd[grid](
             x, w, y, b, z,
             M, N, K,
             x.stride(0), x.stride(1),
@@ -271,7 +229,6 @@ class TritonLinearGELU(torch.autograd.Function):
             TILE_M=BLOCK_M,
             TILE_N=BLOCK_N,
             TILE_K=BLOCK_K,
-            GROUP_M=8,
             DIVISIBLE_M=is_div(M, 64),
             DIVISIBLE_N=is_div(N, 64),
             DIVISIBLE_K=is_div(K, 32),
@@ -296,7 +253,7 @@ class TritonLinearGELU(torch.autograd.Function):
         BLOCK_M, BLOCK_N = 64,64
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
-        gelu_backward_kernel[grid](
+        _gelu_backward_kernel[grid](
             dz, dy, z,
             M, N,
             dy.stride(0), dy.stride(1),
@@ -308,7 +265,7 @@ class TritonLinearGELU(torch.autograd.Function):
 
         # dX = dZ @ W^t
         grid_dx = (triton.cdiv(M, BLOCK_M), triton.cdiv(K, BLOCK_N))
-        matmul_kernel[grid_dx](
+        _matmul_kernel[grid_dx](
             dz, w, dx,
             M, K, N,
             dz.stride(0), dz.stride(1),
@@ -317,7 +274,6 @@ class TritonLinearGELU(torch.autograd.Function):
             TILE_M=BLOCK_M,
             TILE_N=BLOCK_N,
             TILE_K=32,
-            GROUP_M=8,
             DIVISIBLE_M=is_div(M, 64),
             DIVISIBLE_N=is_div(N, 64),
             DIVISIBLE_K=is_div(K, 32),
@@ -325,7 +281,7 @@ class TritonLinearGELU(torch.autograd.Function):
 
         #  dW = X^t @ dZ 
         grid_dw = (triton.cdiv(K, BLOCK_M), triton.cdiv(N, BLOCK_N))
-        matmul_kernel[grid_dw](
+        _matmul_kernel[grid_dw](
             x, dz, dw,
             K, N, M,
             x.stride(1), x.stride(0),   
@@ -345,66 +301,50 @@ class TritonLinearGELU(torch.autograd.Function):
 
         return dx, dw, db
 
+class TritonLinearGeluLayer(torch.nn.Module):
+    def __init__(self, in_features, out_features, bias=True, eps=1e-5, device=None, dtype=None):
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.eps = eps
 
-def test_triton_linear_gelu_correctness():
-    torch.manual_seed(0)
-    device = "cuda"
+        self.weight = torch.nn.Parameter(torch.empty((out_features, in_features), **factory_kwargs))
+        
+        if bias:
+            self.bias = torch.nn.Parameter(torch.empty(out_features, **factory_kwargs))
+        else:
+            self.register_parameter('bias', None)
 
-    # Problem sizes (intentionally non-divisible to stress masks)
-    M, K, N = 257, 513, 769
-    dtype = torch.float32
 
-    # Inputs
-    x = torch.randn(M, K, device=device, dtype=dtype, requires_grad=True)
-    w = torch.randn(K, N, device=device, dtype=dtype, requires_grad=True)
-    b = torch.randn(N, device=device, dtype=dtype, requires_grad=True)
+        self.reset_parameters()
 
-    dy = torch.randn(M, N, device=device, dtype=dtype)
+    def reset_parameters(self):
+        # Standard Kaiming initialization for Linear
+        torch.nn.init.kaiming_uniform_(self.weight, a=torch.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / torch.sqrt(fan_in) if fan_in > 0 else 0
+            torch.nn.init.uniform_(self.bias, -bound, bound)
 
-    
-    def torch_linear_gelu(x, w, b):
-        z = x @ w + b
-        return F.gelu(z)
-
-    y_ref = torch_linear_gelu(x, w, b)
-    y_ref.backward(dy)
-
-    dx_ref = x.grad.detach().clone()
-    dw_ref = w.grad.detach().clone()
-    db_ref = b.grad.detach().clone()
-
-    # Reset grads
-    x.grad.zero_()
-    w.grad.zero_()
-    b.grad.zero_()
-
-  
-    y_tri = TritonLinearGELU.apply(x, w, b)
-    y_tri.backward(dy)
-
-    dx_tri = x.grad.detach()
-    dw_tri = w.grad.detach()
-    db_tri = b.grad.detach()
+    def forward(self, x):
+        """
+        Input x: [*, in_features]
+        """
+       
+        orig_shape = x.shape
+        if x.dim() > 2:
+            x = x.view(-1, orig_shape[-1])
 
     
-    atol = 1e-4
-    rtol = 1e-4
+        out = TritonLinearGELU.apply(
+            x, 
+            self.weight, 
+            self.bias )
 
-    def report(name, tri, ref):
-        max_diff = (tri - ref).abs().max().item()
-        close = torch.allclose(tri, ref, atol=atol, rtol=rtol)
-        print(f"{name:8s}: {'PASS' if close else 'FAIL'} | max diff = {max_diff:.3e}")
-        return close
-
-    print("\n--- Triton Linear + GELU Correctness ---")
-    ok_fwd = report("Forward", y_tri, y_ref)
-    ok_dx  = report("dX", dx_tri, dx_ref)
-    ok_dw  = report("dW", dw_tri, dw_ref)
-    ok_db  = report("dB", db_tri, db_ref)
-
-    assert ok_fwd and ok_dx and ok_dw and ok_db, "Correctness test failed"
-    print("All checks passed!")
-
-
-if __name__ == "__main__":
-    test_triton_linear_gelu_correctness()
+        # Restore original shape
+        if len(orig_shape) > 2:
+            output_shape = list(orig_shape[:-1]) + [self.out_features]
+            out = out.view(*output_shape)
+            
+        return out

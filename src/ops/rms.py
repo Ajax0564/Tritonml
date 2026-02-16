@@ -1,11 +1,9 @@
 import torch
 import triton
 import triton.language as tl
-import triton.testing
-import gc
 
 @triton.jit
-def rms_norm_forward_kernel(
+def _rms_norm_forward_kernel(
     input_ptr, output_ptr, weight_ptr, rstd_ptr,
     stride_xm, stride_xn,
     stride_ym, stride_yn,
@@ -42,7 +40,7 @@ def rms_norm_forward_kernel(
         tl.store(output_ptr + rows[:, None] * stride_ym + c[None, :] * stride_yn, y, mask=mask)
 
 @triton.jit
-def rms_norm_backward_dx_kernel(
+def _rms_norm_backward_dx_kernel(
     dy_ptr, x_ptr, w_ptr, rstd_ptr, dx_ptr,
     stride_dym, stride_dyn,
     stride_xm, stride_xn,
@@ -86,7 +84,7 @@ def rms_norm_backward_dx_kernel(
         tl.store(dx_ptr + rows[:, None] * stride_dxm + c[None, :] * stride_dxn, dx, mask=mask)
 
 @triton.jit
-def rms_norm_backward_dw_kernel(
+def _rms_norm_backward_dw_kernel(
     dy_ptr, x_ptr, rstd_ptr, dw_ptr,
     stride_dym, stride_dyn,
     stride_xm, stride_xn,
@@ -123,7 +121,7 @@ class TritonRMSNorm(torch.autograd.Function):
         BLOCK_M, BLOCK_N = 16, 64
         grid = (triton.cdiv(M, BLOCK_M),)
         
-        rms_norm_forward_kernel[grid](
+        _rms_norm_forward_kernel[grid](
             x, y, weight, rstd,
             x.stride(0), x.stride(1),
             y.stride(0), y.stride(1),
@@ -143,9 +141,9 @@ class TritonRMSNorm(torch.autograd.Function):
         
         BLOCK_M, BLOCK_N = 16, 64
         
-        # Kernel 1: dX
+        #  dX
         grid_dx = (triton.cdiv(M, BLOCK_M),)
-        rms_norm_backward_dx_kernel[grid_dx](
+        _rms_norm_backward_dx_kernel[grid_dx](
             dy, x, weight, rstd, dx,
             dy.stride(0), dy.stride(1),
             x.stride(0), x.stride(1),
@@ -155,9 +153,9 @@ class TritonRMSNorm(torch.autograd.Function):
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
         )
 
-        # Kernel 2: dW
+        # dW
         grid_dw = (triton.cdiv(N, BLOCK_N),)
-        rms_norm_backward_dw_kernel[grid_dw](
+        _rms_norm_backward_dw_kernel[grid_dw](
             dy, x, rstd, dw,
             dy.stride(0), dy.stride(1),
             x.stride(0), x.stride(1),
@@ -168,58 +166,24 @@ class TritonRMSNorm(torch.autograd.Function):
         
         return dx, dw.to(weight.dtype), None
 
+class TritonRMSNormLayer(torch.nn.Module):
+    def __init__(self, hidden_size, eps=1e-6, device=None, dtype=None):
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super().__init__()
+        self.eps = eps
+        # Learnable w
+        self.weight = torch.nn.Parameter(torch.ones(hidden_size, **factory_kwargs))
 
+    def forward(self, x):
+      
+        orig_shape = x.shape
+        x_2d = x.view(-1, orig_shape[-1])
+        
+       
+        out_2d = TritonRMSNorm.apply(x_2d, self.weight, self.eps)
+        
+        # Reshape back 
+        return out_2d.view(*orig_shape)
 
-def test_correctness():
-    M, N = 512, 2048
-    dtype = torch.float32  # Use float32 for strict correctness checks
-    eps = 1e-6
-
-    # 1. Setup Input
-    x = torch.randn((M, N), device='cuda', dtype=dtype, requires_grad=True)
-    w = torch.randn(N, device='cuda', dtype=dtype, requires_grad=True)
-    dy = torch.randn((M, N), device='cuda', dtype=dtype)
-
-    # 2. Reference (PyTorch)
-    # We use a pure torch implementation for the ground truth
-    def torch_rmsnorm(x, w, eps):
-        # RMSNorm: x * rsqrt(mean(x^2) + eps) * w
-        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
-        return x * rms * w
-
-    y_ref = torch_rmsnorm(x, w, eps)
-    y_ref.backward(dy)
-    
-    dx_ref = x.grad.clone()
-    dw_ref = w.grad.clone()
-    
-    # 3. Triton
-    x.grad.zero_()
-    w.grad.zero_()
-    
-    y_tri = TritonRMSNorm.apply(x, w, eps)
-    y_tri.backward(dy)
-    
-    dx_tri = x.grad.clone()
-    dw_tri = w.grad.clone()
-
-    # 4. Verification
-    # Check Forward
-    fwd_max_diff = (y_tri - y_ref).abs().max().item()
-    fwd_close = torch.allclose(y_tri, y_ref, atol=1e-5)
-    
-    # Check Backward dX
-    dx_max_diff = (dx_tri - dx_ref).abs().max().item()
-    dx_close = torch.allclose(dx_tri, dx_ref, atol=1e-5)
-    
-    # Check Backward dW
-    dw_max_diff = (dw_tri - dw_ref).abs().max().item()
-    dw_close = torch.allclose(dw_tri, dw_ref, atol=1e-5)
-
-    print("--- Correctness Report ---")
-    print(f"Forward: {'PASS' if fwd_close else 'FAIL'} (Max Diff: {fwd_max_diff:.2e})")
-    print(f"dX:      {'PASS' if dx_close else 'FAIL'} (Max Diff: {dx_max_diff:.2e})")
-    print(f"dW:      {'PASS' if dw_close else 'FAIL'} (Max Diff: {dw_max_diff:.2e})")
-
-if __name__ == "__main__":
-    test_correctness()
+    def extra_repr(self) -> str:
+        return f'hidden_size={self.weight.shape[0]}, eps={self.eps}'
