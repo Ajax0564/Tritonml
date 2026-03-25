@@ -2,7 +2,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 @triton.jit
 def _linear_gelu_fwd_kernel(
     A, B, C, Bias, Z,
@@ -23,8 +22,8 @@ def _linear_gelu_fwd_kernel(
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
 
     acc = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, TILE_K)):
-        # Recalculate mask inside loop to prevent illegal memory access
+    for _ in range(0, tl.cdiv(K, TILE_K)):
+        #  mask
         mask_a = (offs_m[:, None] < M) & (offs_k[None, :] < K)
         mask_b = (offs_k[:, None] < K) & (offs_n[None, :] < N)
         
@@ -40,7 +39,7 @@ def _linear_gelu_fwd_kernel(
         bias = tl.load(Bias + offs_n, mask=offs_n < N, other=0.0)
         acc += bias[None, :]
 
-    # Store Z (pre-activation)
+    # Store Z
     mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     tl.store(Z + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, acc, mask=mask_c)
 
@@ -48,14 +47,27 @@ def _linear_gelu_fwd_kernel(
     acc = acc * 0.5 * (1.0 + tl.math.erf(acc * 0.70710678118))
     tl.store(C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, acc, mask=mask_c)
 
+
 @triton.jit
 def _matmul_kernel(
-    A, B, C,
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    TILE_M: tl.constexpr, TILE_N: tl.constexpr, TILE_K: tl.constexpr,
+    A,
+    B,
+    C,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    TILE_M: tl.constexpr,
+    TILE_N: tl.constexpr,
+    TILE_K: tl.constexpr,
+    DIVISIBLE_M: tl.constexpr,
+    DIVISIBLE_N: tl.constexpr,
+    DIVISIBLE_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -64,23 +76,55 @@ def _matmul_kernel(
     offs_n = pid_n * TILE_N + tl.arange(0, TILE_N)
     offs_k = tl.arange(0, TILE_K)
 
-    a_ptrs = A + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+    if not DIVISIBLE_M:
+        mask_m = offs_m < M
+    if not DIVISIBLE_N:
+        mask_n = offs_n < N
+
+    a_ptrs = A + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = B + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    c_ptrs = C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
 
     acc = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, TILE_K)):
-        mask_a = (offs_m[:, None] < M) & (offs_k[None, :] < K)
-        mask_b = (offs_k[:, None] < K) & (offs_n[None, :] < N)
-        a = tl.load(a_ptrs, mask=mask_a, other=0.0)
-        b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+    num_iters = tl.cdiv(K, TILE_K)
+
+    for _ in range(num_iters):
+        if DIVISIBLE_K:
+            mask_a = None if DIVISIBLE_M else mask_m[:, None]
+            mask_b = None if DIVISIBLE_N else mask_n[None, :]
+        else:
+            mask_k = offs_k < K
+            mask_a = mask_k[None, :] if DIVISIBLE_M else mask_m[:, None] & mask_k[None, :]
+            mask_b = mask_k[:, None] if DIVISIBLE_N else mask_k[:, None] & mask_n[None, :]
+
+        if mask_a is not None:
+                a = tl.load(a_ptrs, mask=mask_a, other=0.0)
+        else:
+            a = tl.load(a_ptrs)
+
+        if mask_b is not None:
+            b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+        else:
+            b = tl.load(b_ptrs)
+
         acc += tl.dot(a, b)
+
+        offs_k += TILE_K
         a_ptrs += TILE_K * stride_ak
         b_ptrs += TILE_K * stride_bk
-        offs_k += TILE_K
 
-    mask_c = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, acc, mask=mask_c)
 
+    if DIVISIBLE_M and DIVISIBLE_N:
+        mask_c = None
+    elif DIVISIBLE_M:
+        mask_c = mask_n[None, :]
+    elif DIVISIBLE_N:
+        mask_c = mask_m[:, None]
+    else:
+        mask_c = mask_m[:, None] & mask_n[None, :]
+
+    tl.store(c_ptrs, acc, mask=mask_c)
+    
 @triton.jit
 def _bwd_gelu_kernel(
     d_out, W2, d_z1, Z1,
@@ -101,7 +145,7 @@ def _bwd_gelu_kernel(
     w2_ptrs = W2 + (offs_k[:, None] * stride_w2k + offs_n[None, :] * stride_w2n)
 
     acc = tl.zeros((TILE_M, TILE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, TILE_K)):
+    for _ in range(0, tl.cdiv(K, TILE_K)):
         mask_do = (offs_m[:, None] < M) & (offs_k[None, :] < K)
         mask_w2 = (offs_k[:, None] < K) & (offs_n[None, :] < N)
         do = tl.load(do_ptrs, mask=mask_do, other=0.0)
@@ -123,6 +167,32 @@ def _bwd_gelu_kernel(
 
     tl.store(d_z1 + offs_m[:, None] * stride_dzm + offs_n[None, :] * stride_dzn, dz1, mask=mask_c)
 
+@triton.jit
+def _linear_bw_db_kernel(
+    dy_ptr, db_ptr, 
+    M, N, 
+    stride_dym, stride_dyn, 
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    mask_n = offs_n < N
+    offs_m = tl.arange(0, BLOCK_M)
+    # Loop over M 
+    for m in range(0, M, BLOCK_M):
+        offs_m = m + offs_m
+        mask = (offs_m[:, None] < M) & (mask_n[None, :])
+        
+        # Load a tile of dy
+        dy = tl.load(dy_ptr + offs_m[:, None] * stride_dym + offs_n[None, :] * stride_dyn, 
+                     mask=mask, other=0.0)
+        acc += tl.sum(dy, axis=0)
+    tl.store(db_ptr + offs_n, acc, mask=mask_n)
+
+def is_div(val, tile): return val % tile == 0
+    
 class TritonMLPFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w1, b1, w2, b2):
@@ -151,7 +221,10 @@ class TritonMLPFunction(torch.autograd.Function):
             hidden.stride(0), hidden.stride(1),
             w2.stride(1), w2.stride(0), # w2 as (H, N)
             output.stride(0), output.stride(1),
-            TILE_M=64, TILE_N=64, TILE_K=32
+            TILE_M=64, TILE_N=64, TILE_K=32,
+            DIVISIBLE_M=is_div(M, 64),
+            DIVISIBLE_N=is_div(N, 64),
+            DIVISIBLE_K=is_div(H, 32),
         )
         #  bias 
         output += b2
@@ -166,7 +239,12 @@ class TritonMLPFunction(torch.autograd.Function):
         H, _ = w1.shape
         N, _ = w2.shape
 
-        db2 = grad_output.sum(0)
+        # db2 using your custom kernel
+        db2 = torch.empty((N,), device=x.device, dtype=x.dtype)
+        _linear_bw_db_kernel[(triton.cdiv(N, 64),)](
+            grad_output, db2, M, N, grad_output.stride(0), grad_output.stride(1),
+            BLOCK_M=256, BLOCK_N=64
+        )
         
         # dw2 = grad_output^T @ hidden (N, M) @ (M, H) -> (N, H)
         dw2 = torch.empty((N, H), device=x.device, dtype=x.dtype)
@@ -177,7 +255,10 @@ class TritonMLPFunction(torch.autograd.Function):
             grad_output.stride(1), grad_output.stride(0),
             hidden.stride(0), hidden.stride(1),
             dw2.stride(0), dw2.stride(1),
-            TILE_M=64, TILE_N=64, TILE_K=32
+            TILE_M=64, TILE_N=64, TILE_K=32,
+            DIVISIBLE_M=is_div(N, 64),
+            DIVISIBLE_N=is_div(H, 64),
+            DIVISIBLE_K=is_div(M, 32),
         )
 
         # dz1 = (grad_output @ w2) * gelu_grad(z1)
@@ -201,10 +282,17 @@ class TritonMLPFunction(torch.autograd.Function):
             dz1.stride(1), dz1.stride(0),
             x.stride(0), x.stride(1),
             dw1.stride(0), dw1.stride(1),
-            TILE_M=64, TILE_N=64, TILE_K=32
+            TILE_M=64, TILE_N=64, TILE_K=32,
+            DIVISIBLE_M=is_div(H, 64),
+            DIVISIBLE_N=is_div(K, 64),
+            DIVISIBLE_K=is_div(M, 32),
         )
 
-        db1 = dz1.sum(0)
+        db1 = torch.empty((H,), device=x.device, dtype=x.dtype)
+        _linear_bw_db_kernel[(triton.cdiv(H, 64),)](
+            dz1, db1, M, H, dz1.stride(0), dz1.stride(1),
+            BLOCK_M=256, BLOCK_N=64
+        )
         
         # dx = dz1 @ w1 -> (M, H) @ (H, K) -> (M, K)
         dx = torch.empty_like(x)
@@ -215,7 +303,10 @@ class TritonMLPFunction(torch.autograd.Function):
             dz1.stride(0), dz1.stride(1),
             w1.stride(0), w1.stride(1),
             dx.stride(0), dx.stride(1),
-            TILE_M=64, TILE_N=64, TILE_K=32
+            TILE_M=64, TILE_N=64, TILE_K=32,
+            DIVISIBLE_M=is_div(M, 64),
+            DIVISIBLE_N=is_div(K, 64),
+            DIVISIBLE_K=is_div(H, 32),
         )
 
         return dx, dw1, db1, dw2, db2

@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+import math
 
 @triton.jit
 def _linear_layer_gelu_fwd(
@@ -204,34 +205,58 @@ def _gelu_backward_kernel(
 
     tl.store(dz_ptr + rows[:, None] * stride_dzm + cols[None, :] * stride_dzn, dz, mask=mask)
 
+@triton.jit
+def _linear_bw_db_kernel(
+    dy_ptr, db_ptr, 
+    M, N, 
+    stride_dym, stride_dyn, 
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    mask_n = offs_n < N
+    offs_m =  tl.arange(0, BLOCK_M)
+
+    # Loop over M 
+    for m in range(0, M, BLOCK_M):
+        offs_m = m + offs_m
+        mask = (offs_m[:, None] < M) & (mask_n[None, :])
+        
+        # Load a tile of dy
+        dy = tl.load(dy_ptr + offs_m[:, None] * stride_dym + offs_n[None, :] * stride_dyn, 
+                     mask=mask, other=0.0)
+        
+        
+        acc += tl.sum(dy, axis=0)
+    tl.store(db_ptr + offs_n, acc, mask=mask_n)
+    
 def is_div(val, tile): return val % tile == 0
 
 class TritonLinearGELU(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, w, b=None):
         M, K = x.shape
-        K2, N = w.shape
-        assert K == K2
+        N, K2 = w.shape # w is (out_features, in_features)
+        assert K == K2, f"Incompatible shapes: x({K}) and w({K2})"
 
         y = torch.empty((M, N), device=x.device, dtype=x.dtype)
         z = torch.empty_like(y)
 
-        
-        BLOCK_M, BLOCK_N, BLOCK_K = 64,64,32
+        BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
         _linear_layer_gelu_fwd[grid](
             x, w, y, b, z,
             M, N, K,
             x.stride(0), x.stride(1),
-            w.stride(0), w.stride(1),
+            w.stride(1), w.stride(0), # Treat W as (K, N)
             y.stride(0), y.stride(1),
-            TILE_M=BLOCK_M,
-            TILE_N=BLOCK_N,
-            TILE_K=BLOCK_K,
-            DIVISIBLE_M=is_div(M, 64),
-            DIVISIBLE_N=is_div(N, 64),
-            DIVISIBLE_K=is_div(K, 32),
+            TILE_M=BLOCK_M, TILE_N=BLOCK_N, TILE_K=BLOCK_K,
+            DIVISIBLE_M=is_div(M, BLOCK_M),
+            DIVISIBLE_N=is_div(N, BLOCK_N),
+            DIVISIBLE_K=is_div(K, BLOCK_K),
             ADD_BIAS=b is not None,
         )
 
@@ -243,64 +268,65 @@ class TritonLinearGELU(torch.autograd.Function):
     def backward(ctx, dy):
         x, w, z = ctx.saved_tensors
         M, K = x.shape
-        _, N = w.shape
+        N, _ = w.shape
 
         dx = torch.empty_like(x)
         dw = torch.empty_like(w)
         dz = torch.empty_like(dy)
 
-        # dZ = dY * GELU'(Z) 
-        BLOCK_M, BLOCK_N = 64,64
-        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+        BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
 
-        _gelu_backward_kernel[grid](
-            dz, dy, z,
-            M, N,
+        # dZ = dY * GELU'(Z)
+        grid_dz = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+        _gelu_backward_kernel[grid_dz](
+            dz, dy, z, M, N,
             dy.stride(0), dy.stride(1),
             z.stride(0), z.stride(1),
             dz.stride(0), dz.stride(1),
-            BLOCK_M=BLOCK_M,
-            BLOCK_N=BLOCK_N,
+            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
         )
 
-        # dX = dZ @ W^t
+        # dX = dZ @ W  -> (M, N) @ (N, K) = (M, K)
         grid_dx = (triton.cdiv(M, BLOCK_M), triton.cdiv(K, BLOCK_N))
         _matmul_kernel[grid_dx](
             dz, w, dx,
-            M, K, N,
+            M, K, N, # M=M, N=K, K=N
             dz.stride(0), dz.stride(1),
-            w.stride(1), w.stride(0),  # Wᵀ
+            w.stride(0), w.stride(1), # Use W as (N, K)
             dx.stride(0), dx.stride(1),
-            TILE_M=BLOCK_M,
-            TILE_N=BLOCK_N,
-            TILE_K=32,
-            DIVISIBLE_M=is_div(M, 64),
-            DIVISIBLE_N=is_div(N, 64),
-            DIVISIBLE_K=is_div(K, 32),
+            TILE_M=BLOCK_M, TILE_N=BLOCK_N, TILE_K=BLOCK_K,
+            DIVISIBLE_M=is_div(M, BLOCK_M),
+            DIVISIBLE_N=is_div(K, BLOCK_N),
+            DIVISIBLE_K=is_div(N, BLOCK_K),
         )
 
-        #  dW = X^t @ dZ 
-        grid_dw = (triton.cdiv(K, BLOCK_M), triton.cdiv(N, BLOCK_N))
+        # dW = dZ^T @ X -> (N, M) @ (M, K) = (N, K)
+        grid_dw = (triton.cdiv(N, BLOCK_M), triton.cdiv(K, BLOCK_N))
         _matmul_kernel[grid_dw](
-            x, dz, dw,
-            K, N, M,
-            x.stride(1), x.stride(0),   
-            dz.stride(0), dz.stride(1),
+            dz, x, dw,
+            N, K, M, # M=N, N=K, K=M
+            dz.stride(1), dz.stride(0), # dZ to (N, M)
+            x.stride(0), x.stride(1),    # Use X as (M, K)
             dw.stride(0), dw.stride(1),
-            TILE_M=BLOCK_M,
-            TILE_N=BLOCK_N,
-            TILE_K=32,
-            GROUP_M=8,
-            DIVISIBLE_M=is_div(M, 64),
-            DIVISIBLE_N=is_div(N, 64),
-            DIVISIBLE_K=is_div(K, 32),
+            TILE_M=BLOCK_M, TILE_N=BLOCK_N, TILE_K=BLOCK_K,
+            DIVISIBLE_M=is_div(N, BLOCK_M),
+            DIVISIBLE_N=is_div(K, BLOCK_N),
+            DIVISIBLE_K=is_div(M, BLOCK_K),
         )
-
-       
-        db = dz.sum(dim=0) if ctx.has_bias else None
+        if not ctx.has_bias:
+            db = None
+        else:
+            db =  torch.empty(N).to(x.device)
+            grid = (triton.cdiv(N, 128),) 
+            _linear_bw_db_kernel[grid](
+                dz, db, M, N, 
+                dz.stride(0), dz.stride(1),
+                BLOCK_M=256, # Increase load
+                BLOCK_N=128
+            )
 
         return dx, dw, db
-
+        
 class TritonLinearGeluLayer(torch.nn.Module):
     def __init__(self, in_features, out_features, bias=True, eps=1e-5, device=None, dtype=None):
         factory_kwargs = {'device': device, 'dtype': dtype}
@@ -320,11 +346,11 @@ class TritonLinearGeluLayer(torch.nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        # Standard Kaiming initialization for Linear
-        torch.nn.init.kaiming_uniform_(self.weight, a=torch.sqrt(5))
+        torch.nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+    
         if self.bias is not None:
             fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(self.weight)
-            bound = 1 / torch.sqrt(fan_in) if fan_in > 0 else 0
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             torch.nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x):

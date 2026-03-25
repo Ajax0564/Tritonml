@@ -11,7 +11,7 @@ def _attn_fwd_kernel(
     stride_vh, stride_vn, stride_vk,
     stride_oh, stride_om, stride_ok,
     stride_mb, stride_ms,
-    B, H, S_Q, S_K,
+    B, H, S,
     HEAD_DIM: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
 ):
@@ -19,27 +19,28 @@ def _attn_fwd_kernel(
     batch_idx = pid_hz // H
     
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = tl.arange(0, BLOCK_N)
+    rn_ = tl.arange(0, BLOCK_N)
     rk = tl.arange(0, BLOCK_DMODEL)
     rk_mask = rk < HEAD_DIM
 
     q_ptr = Q + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :] * stride_qk
     mask_ptr = MASK + batch_idx * stride_mb
     
-    q = tl.load(q_ptr, mask=(rm[:, None] < S_Q) & (rk_mask[None, :]), other=0.0)
+    q = tl.load(q_ptr, mask=(rm[:, None] < S) & (rk_mask[None, :]), other=0.0)
     
     m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], tl.float32)
 
-    for start_n in range(0, S_K, BLOCK_N):
-        cols = start_n + rn
+    for start_n in range(0, S, BLOCK_N):
+        cols = start_n + rn_
+        cols_mask = cols[None, :] < S
         
         k_ptr = K + pid_hz * stride_kh + cols[None, :] * stride_kn + rk[:, None] * stride_kk
-        k = tl.load(k_ptr, mask=(cols[None, :] < S_K) & (rk_mask[:, None]), other=0.0)
+        k = tl.load(k_ptr, mask=(cols_mask) & (rk_mask[:, None]), other=0.0)
         
-        qk = tl.dot(q, k) * sm_scale
-        m_tile = tl.load(mask_ptr + cols[None, :] * stride_ms, mask=cols[None, :] < S_K, other=-float("inf"))
+        qk = tl.dot(q, k,out_dtype=tl.float32) * sm_scale
+        m_tile = tl.load(mask_ptr + cols[None, :] * stride_ms, mask=cols_mask, other=-float("inf"))
         qk += m_tile 
 
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
@@ -47,15 +48,15 @@ def _attn_fwd_kernel(
         alpha = tl.exp(m_i - m_ij)
         
         v_ptr = V + pid_hz * stride_vh + cols[:, None] * stride_vn + rk[None, :] * stride_vk
-        v = tl.load(v_ptr, mask=(cols[:, None] < S_K) & (rk_mask[None, :]), other=0.0)
+        v = tl.load(v_ptr, mask=(cols[:, None] < S) & (rk_mask[None, :]), other=0.0)
         
-        acc = acc * alpha[:, None] + tl.dot(p, v)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v,out_dtype=tl.float32)
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_ij
 
     out_ptr = Out + pid_hz * stride_oh + rm[:, None] * stride_om + rk[None, :] * stride_ok
-    tl.store(out_ptr, (acc / l_i[:, None]), mask=(rm[:, None] < S_Q) & (rk_mask[None, :]))
-    tl.store(LSE + pid_hz * S_Q + rm, m_i + tl.log(l_i), mask=rm < S_Q)
+    tl.store(out_ptr, (acc / l_i[:, None]).to(Out.dtype.element_ty), mask=((rm[:, None] < S) & (rk_mask[None, :])))
+    tl.store(LSE + pid_hz * S + rm, m_i + tl.log(l_i), mask=rm < S)
 
 @triton.jit
 def _bwd_preprocess_kernel(
@@ -90,6 +91,7 @@ def _bwd_kernel_dq(
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rk = tl.arange(0, BLOCK_DMODEL)
     rk_mask = rk < HEAD_DIM
+    rn_ = tl.arange(0, BLOCK_N)
     
     q = tl.load(Q + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :]*stride_qk, mask=(rm[:, None] < S) & (rk_mask[None, :]), other=0.0)
     do = tl.load(dO + pid_hz * stride_doh + rm[:, None] * stride_dom + rk[None, :]*stride_dok, mask=(rm[:, None] < S) & (rk_mask[None, :]), other=0.0)
@@ -99,20 +101,21 @@ def _bwd_kernel_dq(
 
     dq = tl.zeros([BLOCK_M, BLOCK_DMODEL], tl.float32)
     for start_n in range(0, S, BLOCK_N):
-        rn = start_n + tl.arange(0, BLOCK_N)
+        rn = start_n + rn_
+        rn_mask = rn[None,:] < S
         
-        k = tl.load(K + pid_hz * stride_kh + rn[None, :] * stride_kn + rk[:, None] * stride_kk, mask=(rn[None, :] < S) & (rk_mask[:, None]), other=0.0)
+        k = tl.load(K + pid_hz * stride_kh + rn[None, :] * stride_kn + rk[:, None] * stride_kk, mask=(rn_mask) & (rk_mask[:, None]), other=0.0)
         v = tl.load(V + pid_hz * stride_vh + rn[:, None] * stride_vn + rk[None, :] * stride_vk, mask=(rn[:, None] < S) & (rk_mask[None, :]), other=0.0)
         
-        qk = tl.dot(q, k) * sm_scale
-        m_tile = tl.load(mask_ptr + rn[None, :] * stride_ms, mask=rn[None, :] < S, other=-float('inf'))
+        qk = tl.dot(q, k,out_dtype=tl.float32) * sm_scale
+        m_tile = tl.load(mask_ptr + rn[None, :] * stride_ms, mask=rn_mask, other=-float('inf'))
         
-        p = tl.exp(qk+m_tile - lse[:, None])
+        p =  tl.exp((qk + m_tile).to(tl.float32) - lse[:, None])
         
-        dp = (tl.dot(do, tl.trans(v)) - di[:, None]) * p
-        dq += tl.dot(dp, tl.trans(k))
+        dp = (tl.dot(do, tl.trans(v),out_dtype=tl.float32) - di[:, None]) * p
+        dq += tl.dot(dp.to(k.dtype), tl.trans(k),out_dtype=tl.float32)
     
-    tl.store(dQ + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :], dq * sm_scale, mask=(rm[:, None] < S) & (rk_mask[None, :]))
+    tl.store(dQ + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :], (dq * sm_scale).to(dQ.dtype.element_ty), mask=(rm[:, None] < S) & (rk_mask[None, :]))
 
 @triton.jit
 def _bwd_kernel_dkdv(
@@ -130,8 +133,8 @@ def _bwd_kernel_dkdv(
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     rk = tl.arange(0, BLOCK_DMODEL)
     rk_mask = rk < HEAD_DIM
+    rm_ =  tl.arange(0, BLOCK_M)
     
-   
     mask_ptr = MASK + batch_idx * stride_mb
     m_tile = tl.load(mask_ptr + rn[None, :] * stride_ms, mask=rn[None, :] < S, other=-float('inf'))
     
@@ -142,22 +145,24 @@ def _bwd_kernel_dkdv(
     dv = tl.zeros([BLOCK_N, BLOCK_DMODEL], tl.float32)
 
     for start_m in range(0, S, BLOCK_M):
-        rm = start_m + tl.arange(0, BLOCK_M)
-        q = tl.load(Q + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :] * stride_qk, mask=(rm[:, None] < S) & (rk_mask[None, :]), other=0.0)
-        do = tl.load(dO + pid_hz * stride_doh + rm[:, None] * stride_dom + rk[None, :] * stride_dok, mask=(rm[:, None] < S) & (rk_mask[None, :]), other=0.0)
-        lse = tl.load(LSE + pid_hz * S + rm, mask=rm < S)
-        di = tl.load(D_vec + pid_hz * S + rm, mask=rm < S)
+        rm = start_m + rm_
+        rm_mask = rm[:, None] < S
+        rm_mask_ = rm < S
+        q = tl.load(Q + pid_hz * stride_qh + rm[:, None] * stride_qm + rk[None, :] * stride_qk, mask=(rm_mask) & (rk_mask[None, :]), other=0.0)
+        do = tl.load(dO + pid_hz * stride_doh + rm[:, None] * stride_dom + rk[None, :] * stride_dok, mask=(rm_mask) & (rk_mask[None, :]), other=0.0)
+        lse = tl.load(LSE + pid_hz * S + rm, mask=rm_mask_)
+        di = tl.load(D_vec + pid_hz * S + rm, mask=rm_mask_)
 
-        qk = tl.dot(q, tl.trans(k)) * sm_scale
+        qk = tl.dot(q, tl.trans(k),out_dtype=tl.float32) * sm_scale
        
-        p = tl.exp(qk+m_tile - lse[:, None])
+        p =  tl.exp((qk + m_tile).to(tl.float32) - lse[:, None])
 
-        dv += tl.dot(tl.trans(p), do)
-        dp = (tl.dot(do, tl.trans(v)) - di[:, None]) * p
-        dk += tl.dot(tl.trans(dp), q)
+        dv += tl.dot(tl.trans(p.to(do.dtype)), do,out_dtype=tl.float32)
+        dp = (tl.dot(do, tl.trans(v),out_dtype=tl.float32) - di[:, None]) * p
+        dk += tl.dot(tl.trans(dp.to(q.dtype)), q,out_dtype=tl.float32)
 
-    tl.store(dK + pid_hz * stride_kh + rn[:, None] * stride_kn + rk[None, :] * stride_kk, dk * sm_scale, mask=(rn[:, None] < S) & (rk_mask[None, :]))
-    tl.store(dV + pid_hz * stride_vh + rn[:, None] * stride_vn + rk[None, :] * stride_vk, dv, mask=(rn[:, None] < S) & (rk_mask[None, :]))
+    tl.store(dK + pid_hz * stride_kh + rn[:, None] * stride_kn + rk[None, :] * stride_kk, (dk * sm_scale).to(dK.dtype.element_ty), mask=(rn[:, None] < S) & (rk_mask[None, :]))
+    tl.store(dV + pid_hz * stride_vh + rn[:, None] * stride_vn + rk[None, :] * stride_vk, dv.to(dV.dtype.element_ty), mask=(rn[:, None] < S) & (rk_mask[None, :]))
 
 class FlashAttentionMasked(torch.autograd.Function):
     @staticmethod
@@ -167,22 +172,21 @@ class FlashAttentionMasked(torch.autograd.Function):
         
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         mask = mask.contiguous()
-        B, H, S_Q, D = q.shape
-        S_K = k.shape[2]
+        B, H, S, D = q.shape
         BLOCK_DMODEL = triton.next_power_of_2(D)
         
         out = torch.empty_like(q)
-        lse = torch.empty((B, H, S_Q), device=q.device, dtype=torch.float32)
+        lse = torch.empty((B, H, S), device=q.device, dtype=torch.float32)
         BLOCK_M, BLOCK_N = 32,32
 
-        _attn_fwd_kernel[(triton.cdiv(S_Q, BLOCK_M), B * H)](
+        _attn_fwd_kernel[(triton.cdiv(S, BLOCK_M), B * H)](
             q, k, v, sm_scale, lse, out, mask,
             q.stride(1), q.stride(2), q.stride(3),
             k.stride(1), k.stride(2), k.stride(3),
             v.stride(1), v.stride(2), v.stride(3),
             out.stride(1), out.stride(2), out.stride(3),
             mask.stride(0), mask.stride(1),
-            B, H, S_Q, S_K,
+            B, H, S,
             HEAD_DIM=D, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, 
             BLOCK_DMODEL=BLOCK_DMODEL
         )
@@ -229,8 +233,7 @@ class FlashAttentionMasked(torch.autograd.Function):
             mask.stride(0), mask.stride(1),
             B, H, S, HEAD_DIM=D, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_DMODEL=BLOCK_DMODEL
         )
-        return dq, dk, dv, None, None
-    
+        return dq, dk, dv, None, None    
 
 class TritonMaskedAttention(torch.nn.Module):
     def __init__(self, sm_scale=None):
@@ -243,6 +246,6 @@ class TritonMaskedAttention(torch.nn.Module):
             q, k, v: Tensors of shape (Batch, Heads, Seq_Len, Head_Dim)
             mask: Tensor of shape (Batch, Seq_Len)
         """
-        scale = self.sm_scale if self.sm_scale is not None else 1.0 / torch.sqrt(q.size(-1))
+        scale = self.sm_scale if self.sm_scale is not None else q.size(-1)**-0.5
         
         return FlashAttentionMasked.apply(q, k, v, mask, scale)

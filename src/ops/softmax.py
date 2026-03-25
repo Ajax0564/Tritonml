@@ -17,10 +17,10 @@ def _online_softmax_kernel(
     # Init stats for each row block
     m_row = tl.full([BLOCK_M], value=-float('inf'), dtype=tl.float32)
     d_row = tl.zeros([BLOCK_M], dtype=tl.float32)
-    
+    col_offsets = tl.arange(0, TILE_SIZE)
     # Online way of Max and SumExp
     for start_col in range(0, N, TILE_SIZE):
-        col_offsets = start_col + tl.arange(0, TILE_SIZE)
+        col_offsets = start_col + col_offsets
         mask = (row_offsets[:, None]<M) & (col_offsets[None, :] < N)
         
         tile_ptr = input_ptr + row_offsets[:, None] * stride_m + col_offsets[None, :]*stride_n
@@ -33,8 +33,9 @@ def _online_softmax_kernel(
         m_row = m_new
 
     # Norm and save
+    col_offsets = tl.arange(0, TILE_SIZE)
     for start_col in range(0, N, TILE_SIZE):
-        col_offsets = start_col + tl.arange(0, TILE_SIZE)
+        col_offsets = start_col + col_offsets
         mask = (row_offsets[:, None]<M) & (col_offsets[None, :] < N)
         
         tile_ptr = input_ptr + row_offsets[:, None] * stride_m + col_offsets[None, :]*stride_n
@@ -59,11 +60,12 @@ def _softmax_backward_kernel(
    
 
     row_offsets = pid_row * BLOCK_M + tl.arange(0, BLOCK_M)
+    col_offsets =  tl.arange(0, TILE_SIZE)
 
     # Compute sum(d_out * y) for each row in the block
     sum_dy_y = tl.zeros([BLOCK_M], dtype=tl.float32)
     for start_col in range(0, N, TILE_SIZE):
-        col_offsets = start_col + tl.arange(0, TILE_SIZE)
+        col_offsets = start_col + col_offsets
         mask = (row_offsets[:, None]<M) & (col_offsets[None, :] < N)
         
         do_tile_ptr = d_out_ptr + row_offsets[:, None] * stride_gr + col_offsets[None, :]*stride_gc
@@ -75,8 +77,9 @@ def _softmax_backward_kernel(
         sum_dy_y += tl.sum(dy_tile * y_tile, axis=1)
 
     # dx = y * (dy - sum_dy_y)
+    col_offsets =  tl.arange(0, TILE_SIZE)
     for start_col in range(0, N, TILE_SIZE):
-        col_offsets = start_col + tl.arange(0, TILE_SIZE)
+        col_offsets = start_col + col_offsets
         mask = (row_offsets[:, None]<M) & (col_offsets[None, :] < N)
         
         do_tile_ptr = d_out_ptr + row_offsets[:, None] * stride_gr + col_offsets[None, :]*stride_gc

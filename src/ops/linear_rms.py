@@ -1,7 +1,6 @@
 import torch
 import triton
 import triton.language as tl
-from torch.autograd import Function
 import math 
 
 @triton.jit
@@ -167,7 +166,6 @@ def _matmul_kernel(
 
     tl.store(c_ptrs, acc, mask=mask_c)
 
-
 @triton.jit
 def _rms_norm_forward_kernel(
     input_ptr, output_ptr, weight_ptr, rstd_ptr,
@@ -186,7 +184,7 @@ def _rms_norm_forward_kernel(
     # calculate (x*x)
     acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
     for k in range(0, N, BLOCK_N):
-        c = k+ tl.arange(0, BLOCK_N)
+        c = k+ cols
         mask = (rows[:, None]<M) & (c[None, :] < N)
         x = tl.load(input_ptr + rows[:, None] * stride_xm + c[None, :] * stride_xn, mask=mask, other=0.0).to(tl.float32)
         acc += tl.sum(x * x, axis=1)
@@ -223,10 +221,10 @@ def _rms_norm_backward_dx_kernel(
 
     rstd = tl.load(rstd_ptr + rows * stride_rm, mask=row_mask, other=0.0)
 
-    # Row-wise dot product: sum(dY * W * X * rstd)
+    # Row-wise dot product -> sum(dY * W * X * rstd)
     row_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
     for k in range(0,N, BLOCK_N):
-        c =  k + tl.arange(0, BLOCK_N)
+        c =  k + cols
         mask = (rows[:, None]<M) & (c[None, :] < N)
         
         dy = tl.load(dy_ptr + rows[:, None] * stride_dym + c[None, :] * stride_dyn, mask=mask, other=0.0).to(tl.float32)
@@ -263,9 +261,9 @@ def _rms_norm_backward_dw_kernel(
     col_mask = cols < N
 
     acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
-
+    rows = tl.arange(0, BLOCK_M)
     for m in range(0, M, BLOCK_M):
-        rows = m + tl.arange(0, BLOCK_M)
+        rows = m + rows
         row_mask = rows < M
         mask = row_mask[:, None] & col_mask[None, :]
 
@@ -278,6 +276,33 @@ def _rms_norm_backward_dw_kernel(
     tl.store(dw_ptr + cols, acc, mask=col_mask)
 
 
+@triton.jit
+def _linear_bw_db_kernel(
+    dy_ptr, db_ptr, 
+    M, N, 
+    stride_dym, stride_dyn, 
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr
+):
+    pid = tl.program_id(axis=0)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    mask_n = offs_n < N
+    offs_m =  tl.arange(0, BLOCK_M)
+    # Loop over M 
+    for m in range(0, M, BLOCK_M):
+        offs_m = m + offs_m
+        mask = (offs_m[:, None] < M) & (mask_n[None, :])
+        
+        # Load a tile of dy
+        dy = tl.load(dy_ptr + offs_m[:, None] * stride_dym + offs_n[None, :] * stride_dyn, 
+                     mask=mask, other=0.0)
+        
+        
+        acc += tl.sum(dy, axis=0)
+    tl.store(db_ptr + offs_n, acc, mask=mask_n)
+
+def is_div(val, tile): return val % tile == 0
 
 class TritonLinearRMSNorm(torch.autograd.Function):
     @staticmethod
@@ -296,7 +321,6 @@ class TritonLinearRMSNorm(torch.autograd.Function):
         y = torch.empty((M, N), device=x.device, dtype=x.dtype)
         BLOCK_M, BLOCK_N, BLOCK_K = 64,64, 32
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
-
         # w is [N, K]
         _linear_kernel_fwd[grid](
             x, w, y, b,
@@ -307,9 +331,9 @@ class TritonLinearRMSNorm(torch.autograd.Function):
             TILE_M=BLOCK_M,
             TILE_N=BLOCK_N,
             TILE_K=BLOCK_K,
-            DIVISIBLE_M=False,
-            DIVISIBLE_N=False,
-            DIVISIBLE_K=False,
+            DIVISIBLE_M=is_div(M, 64),
+            DIVISIBLE_N=is_div(N, 64), # Output N is K
+            DIVISIBLE_K=is_div(K, 32),   # Inner K is N
             ADD_BIAS=b is not None,
         )
 
@@ -361,26 +385,38 @@ class TritonLinearRMSNorm(torch.autograd.Function):
             w.stride(0), w.stride(1),
             dx.stride(0), dx.stride(1),
             TILE_M=BLOCK_M, TILE_N=BLOCK_N, TILE_K=32,
-             DIVISIBLE_M=False, DIVISIBLE_N=False, DIVISIBLE_K=False,
+            DIVISIBLE_M=is_div(M, BLOCK_M),
+            DIVISIBLE_N=is_div(K, BLOCK_N), # Output N is K
+            DIVISIBLE_K=is_div(N, 32), 
         )
 
         #  [N, M] @ [M, K] -> [N, K])
         dw = torch.empty_like(w)
         grid_dw = (triton.cdiv(N, BLOCK_M), triton.cdiv(K, BLOCK_N))
+        #MNK->NKM
         _matmul_kernel[grid_dw](
             dy, x, dw,
             N, K, M,
             dy.stride(1), dy.stride(0), # Transpose dy: [N, M]
             x.stride(0), x.stride(1),   # x: [M, K]
             dw.stride(0), dw.stride(1),
-            TILE_M=BLOCK_M, TILE_N=BLOCK_N, TILE_K=32,
-            DIVISIBLE_M=False, DIVISIBLE_N=False, DIVISIBLE_K=False,
+            TILE_M=BLOCK_N, TILE_N=BLOCK_N, TILE_K=32,
+            DIVISIBLE_M=is_div(N, BLOCK_M),
+            DIVISIBLE_N=is_div(K, BLOCK_N), 
+            DIVISIBLE_K=is_div(M, 32), 
         )
-
-        #  dB = sum(dy) 
-        db = dy.sum(dim=0) if ctx.has_bias else None
-
-        # weight grad 
+        
+        if not ctx.has_bias:
+            db = None
+        else:
+            db =  torch.empty(N).to(x.device)
+            grid = (triton.cdiv(N, 128),) 
+            _linear_bw_db_kernel[grid](
+                dy, db, M, N, 
+                dy.stride(0), dy.stride(1),
+                BLOCK_M=256, # Increase load
+                BLOCK_N=128
+            )
         drms = torch.empty_like(rms_weight)
         _rms_norm_backward_dw_kernel[(triton.cdiv(N, BLOCK_N),)](
             dz, y, rstd, drms,

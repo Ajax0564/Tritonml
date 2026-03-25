@@ -20,7 +20,7 @@ def _rms_norm_forward_kernel(
     # calculate (x*x)
     acc = tl.zeros((BLOCK_M,), dtype=tl.float32)
     for k in range(0, N, BLOCK_N):
-        c = k+ tl.arange(0, BLOCK_N)
+        c = k+cols
         mask = (rows[:, None]<M) & (c[None, :] < N)
         x = tl.load(input_ptr + rows[:, None] * stride_xm + c[None, :] * stride_xn, mask=mask, other=0.0).to(tl.float32)
         acc += tl.sum(x * x, axis=1)
@@ -60,7 +60,7 @@ def _rms_norm_backward_dx_kernel(
     # Row-wise dot product: sum(dY * W * X * rstd)
     row_sum = tl.zeros((BLOCK_M,), dtype=tl.float32)
     for k in range(0,N, BLOCK_N):
-        c =  k + tl.arange(0, BLOCK_N)
+        c =  k + cols
         mask = (rows[:, None]<M) & (c[None, :] < N)
         
         dy = tl.load(dy_ptr + rows[:, None] * stride_dym + c[None, :] * stride_dyn, mask=mask, other=0.0).to(tl.float32)
@@ -95,11 +95,11 @@ def _rms_norm_backward_dw_kernel(
     pid_n = tl.program_id(0)
     cols = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     col_mask = cols < N
-
+    rows = tl.arange(0, BLOCK_M)
     acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
     for m in range(0, M, BLOCK_M):
-        rows = m + tl.arange(0, BLOCK_M)
+        rows = m + rows
         row_mask = rows < M
         mask = row_mask[:, None] & col_mask[None, :]
 

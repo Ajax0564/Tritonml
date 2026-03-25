@@ -2,7 +2,6 @@ import triton
 import triton.language as tl
 import torch
 from torch import nn
-import torch.nn.functional as F
 
 @triton.jit
 def _linear_kernel_fwd(
@@ -89,7 +88,7 @@ def _linear_kernel_fwd(
         mask_c = mask_m[:, None] & mask_n[None, :]
 
     tl.store(c_ptrs, acc, mask=mask_c)
-
+    
 @triton.jit
 def _matmul_kernel(
     A,
@@ -166,7 +165,7 @@ def _matmul_kernel(
         mask_c = mask_m[:, None] & mask_n[None, :]
 
     tl.store(c_ptrs, acc, mask=mask_c)
-
+    
 @triton.jit
 def _linear_bw_db_kernel(
     dy_ptr, db_ptr, 
@@ -176,16 +175,25 @@ def _linear_bw_db_kernel(
 ):
     pid = tl.program_id(axis=0)
     offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+
     acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    mask_n = offs_n < N
 
-    for m in range(0, tl.cdiv(M, BLOCK_M)):
-        offs_m = m * BLOCK_M + tl.arange(0, BLOCK_M)
-        mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-        dy = tl.load(dy_ptr + offs_m[:, None] * stride_dym + offs_n[None, :] * stride_dyn, mask=mask, other=0.0)
+    # Loop over M 
+    for m in range(0, M, BLOCK_M):
+        offs_m = m + tl.arange(0, BLOCK_M)
+        mask = (offs_m[:, None] < M) & (mask_n[None, :])
+        
+        # Load a tile of dy
+        dy = tl.load(dy_ptr + offs_m[:, None] * stride_dym + offs_n[None, :] * stride_dyn, 
+                     mask=mask, other=0.0)
+        
+        
         acc += tl.sum(dy, axis=0)
-
-    tl.store(db_ptr + offs_n, acc, mask=offs_n < N)
-
+    tl.store(db_ptr + offs_n, acc, mask=mask_n)
+    
+def is_div(val, tile): return val % tile == 0
+    
 class TritonLinearFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, bias):
@@ -193,9 +201,6 @@ class TritonLinearFunction(torch.autograd.Function):
         M, K = x.shape
         N, _ = weight.shape
         y = torch.empty((M, N), device=x.device, dtype=x.dtype)
-        div_m = M % 64 == 0
-        div_n = N % 64 == 0
-        div_k = K % 32 == 0
         
         grid = lambda meta: (
         triton.cdiv(M, meta["TILE_M"]),
@@ -204,7 +209,7 @@ class TritonLinearFunction(torch.autograd.Function):
         
         # X @ W.T+b
         _linear_kernel_fwd[grid](
-            x, weight, y, bias,
+            x, weight, y, bias if bias is not None else x,
             M, N, K,
             x.stride(0), x.stride(1),
             weight.stride(1), weight.stride(0), # (N, K) as (K, N)
@@ -212,26 +217,24 @@ class TritonLinearFunction(torch.autograd.Function):
             TILE_M=64,
             TILE_N=64,
             TILE_K=32,
-            DIVISIBLE_M=div_m,
-            DIVISIBLE_N=div_n,
-            DIVISIBLE_K=div_k,
-            ADD_BIAS=bias is not None
+            DIVISIBLE_M=is_div(M, 64),
+            DIVISIBLE_N=is_div(N, 64), # Output N is K
+            DIVISIBLE_K=is_div(K, 32),   # Inner K is N
+            ADD_BIAS=bias is not None,
+            
         )
-        ctx.save_for_backward(x, weight, bias)
+        ctx.save_for_backward(x, weight)
+        ctx.has_bias = bias is not None
         return y
 
     @staticmethod
     def backward(ctx, dy):
-        x, weight, bias = ctx.saved_tensors
+        x, weight = ctx.saved_tensors
         M, K = x.shape
         N, _ = weight.shape
         
         dx = torch.empty_like(x)
         dw = torch.empty_like(weight)
-        db = torch.empty_like(bias) if bias is not None else None
-
-        # Helper 
-        def is_div(val, tile): return val % tile == 0
 
         # (M, N) @ (N, K) = (M, K)
         grid_dx = lambda meta: (
@@ -244,11 +247,10 @@ class TritonLinearFunction(torch.autograd.Function):
             dy.stride(0), dy.stride(1),
             weight.stride(0), weight.stride(1),
             dx.stride(0), dx.stride(1),
-            TILE_M=64, TILE_N=64, TILE_K=32,
+            TILE_M=64, TILE_N=32, TILE_K=64,
             DIVISIBLE_M=is_div(M, 64),
             DIVISIBLE_N=is_div(K, 64), # Output N is K
-            DIVISIBLE_K=is_div(N, 32)   # Inner K is N
-        )
+            DIVISIBLE_K=is_div(N, 32), )
 
         #  (N, M) @ (M, K) = (N, K)
         grid_dw = lambda meta: (
@@ -261,15 +263,23 @@ class TritonLinearFunction(torch.autograd.Function):
             dy.stride(1), dy.stride(0), # Transpose dy
             x.stride(0), x.stride(1),
             dw.stride(0), dw.stride(1),
-            TILE_M=64, TILE_N=64, TILE_K=32,
+            TILE_M=32, TILE_N=64, TILE_K=64,
             DIVISIBLE_M=is_div(N, 64),
-            DIVISIBLE_N=is_div(K, 64),
-            DIVISIBLE_K=is_div(M, 32)
-        )
-        if bias is None:
+            DIVISIBLE_N=is_div(K, 64), # Output N is K
+            DIVISIBLE_K=is_div(N, 32), )
+
+        
+        if  not ctx.has_bias:
             db = None
         else:
-            db = dy.sum(0)
+            db =  torch.empty(N).to(x.device)
+            grid = (triton.cdiv(N, 128),) 
+            _linear_bw_db_kernel[grid](
+                dy, db, M, N, 
+                dy.stride(0), dy.stride(1),
+                BLOCK_M=256, # Increase this to do more work per load
+                BLOCK_N=128
+            )
 
         return dx, dw, db
         
